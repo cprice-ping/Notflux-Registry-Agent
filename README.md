@@ -2,212 +2,277 @@
 
 A fine-grained authorization registry for agentic AI systems, built on [SpiceDB](https://github.com/authzed/spicedb).
 
-Agents, capabilities, and namespaces are modeled as first-class resources with explicit relationship bindings. SpiceDB evaluates permission checks via a Zanzibar-compatible graph, ensuring zero-trust access control between agents, their owners, and the capabilities they are permitted to exercise.
+Agents and MCP servers are modeled as first-class resources. An ADK-based governor agent manages the registry through natural language, while a Next.js dashboard gives administrators live visibility and Human-in-the-Loop control over every permission change.
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│                   Agent Registry                 │
-│                                                  │
-│  namespace ──► agent ──► capability              │
-│      │            │                              │
-│    admin         owner / viewer                  │
-└──────────────────────────────────────────────────┘
-         │
-         ▼
-     SpiceDB (gRPC + HTTP)
+┌─────────────────────────────────────────────────────────────────┐
+│  Browser                                                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Next.js Dashboard  (CopilotKit v2)                       │  │
+│  │  • Reactive relationship table & metrics cards            │  │
+│  │  • Inline tool renderers (schema, relationships, checks)  │  │
+│  │  • PingOne PKCE login + token exchange                    │  │
+│  └────────────────────┬──────────────────────────────────────┘  │
+└───────────────────────│─────────────────────────────────────────┘
+                        │  AG-UI (CopilotKit protocol)
+                        ▼
+         ┌──────────────────────────────┐
+         │  Registry Governor           │
+         │  (Google ADK + ag_ui_adk)    │
+         │  • LlmAgent (Gemini)         │
+         │  • Per-turn MCP token exch.  │
+         └──────────────┬───────────────┘
+                        │  MCP streamable-HTTP
+                        ▼
+         ┌──────────────────────────────┐
+         │  SpiceDB MCP Bridge          │
+         │  (FastMCP + Starlette)       │
+         │  • read/write_schema         │
+         │  • update_relationships      │
+         │  • check_permission          │
+         │  • read_relationships        │
+         │  • Live schema token check   │
+         └──────────────┬───────────────┘
+                        │  SpiceDB HTTP REST API
+                        ▼
+         ┌──────────────────────────────┐
+         │  SpiceDB                     │
+         │  Zanzibar-compatible         │
+         │  permission graph            │
+         └──────────────────────────────┘
 ```
+
+All three application components run in the `ping-devops-cprice` Kubernetes namespace, co-located with SpiceDB.
+
+---
 
 ## Repository Structure
 
 ```
 .
-├── README.md
 ├── schema/
-│   └── schema.zed           # The relationship graph definitions
-├── k8s/
-│   ├── secrets.yaml         # Preshared key for API authentication
-│   ├── deployment.yaml      # SpiceDB service and runtime pod definitions
-│   ├── patch-p1az.yaml      # HTTP Data Connector reference instructions
-│   └── mcp-bridge.yaml      # MCP Bridge deployment, service and ingress
-├── mcp/
-│   ├── server.py            # FastMCP server (streamable HTTP transport)
+│   └── schema.zed              # SpiceDB permission model
+├── frontend/                   # Next.js dashboard (CopilotKit v2)
+│   ├── src/app/
+│   │   ├── page.tsx            # Main dashboard: auth, state, tool renderers
+│   │   └── api/
+│   │       ├── copilotkit/     # CopilotKit → AG-UI proxy endpoint
+│   │       └── oidc/callback/  # PingOne OIDC code + token exchange
+│   └── Dockerfile
+├── agent/                      # Registry Governor (ADK agent)
+│   ├── agent.py                # LlmAgent definition + PingOne token exchange
+│   ├── server.py               # AG-UI FastAPI server entry point
 │   ├── requirements.txt
 │   └── Dockerfile
-└── scripts/
-    └── bootstrap.sh         # Convenience script to apply files
+├── k8s/
+│   ├── deployment.yaml         # SpiceDB deployment + ClusterIP service
+│   ├── frontend.yaml           # Frontend deployment, service, ingress
+│   ├── registry-agent.yaml     # Agent deployment, service, ingress
+│   ├── mcp-bridge.yaml         # MCP Bridge deployment, service, ingress
+│   ├── patch-p1az.yaml         # PingOne Advanced Services gateway patch
+│   ├── mcp/                    # SpiceDB MCP Bridge source
+│   │   ├── server.py
+│   │   ├── requirements.txt
+│   │   └── Dockerfile
+│   └── secrets.yaml            # ⚠ Not committed — see Configuration below
+├── scripts/
+│   └── bootstrap.sh            # One-shot cluster apply script
+└── .gitignore
 ```
 
-## Prerequisites
+---
 
-- A running Kubernetes cluster
-- `kubectl` configured for the target cluster
-- `zed` CLI (optional – for interactive schema management)
+## Permission Model
 
-## Quick Start
+The SpiceDB schema (`schema/schema.zed`) defines four object types:
+
+| Type | Description |
+|---|---|
+| `user` | A human principal (administrator) |
+| `agent` | An autonomous AI agent (e.g. a Vertex AI reasoning engine) |
+| `mcp_server` | A named collection of MCP tools |
+| `mcp_tool` | A single callable MCP tool |
+
+### Relations & permissions
+
+```
+agent
+  └── owner: user                      — which human owns this agent
+
+mcp_server
+  ├── authorized_agent: agent          — agent has blanket access to all tools on this server
+  ├── authorized_user: user            — user can view this server
+  └── public_to_all_users: user:*      — open to all authenticated users
+      └── view_server (permission) = authorized_user + public_to_all_users
+
+mcp_tool
+  ├── parent_server: mcp_server        — which server this tool belongs to
+  └── direct_agent: agent              — agent has direct access to this specific tool
+      └── execute (permission) = direct_agent + parent_server->authorized_agent
+```
+
+An agent can execute a tool if it has **either** a `direct_agent` relationship on the tool **or** an `authorized_agent` relationship on the tool's parent server.
+
+---
+
+## Auth & Token Flow
+
+The system uses PingOne as its identity provider with a two-hop token exchange:
+
+```
+1. Browser                  2. Frontend (server-side)       3. Agent (per-turn)
+───────────────────         ──────────────────────────      ───────────────────
+PKCE login (PingOne)   →    Exchange 1:                 →   Exchange 2:
+  id_token / code           person_token                    agent_token
+                            (aud = registry-person)    →    mcp_token
+                                  │                         (aud = registry-mcp)
+                            Exchange 1b:                         │
+                            agent_token                          ▼
+                            (aud = registry-agent)       McpToolset per turn
+                            stored as httpOnly cookie     with Authorization: Bearer mcp_token
+                            registry_agent_token
+```
+
+**Key detail:** The `registry_agent_token` cookie is set by `/api/oidc/callback` on every login _and_ on every page load for cached sessions (the frontend re-runs Exchange 1b on mount if a `registry_person_token` is already in sessionStorage). This ensures the agent always has a valid MCP token even after the container restarts.
+
+---
+
+## Components
+
+### Frontend — `frontend/`
+
+Next.js 15 app using **CopilotKit v2** (`@copilotkit/react-core/v2`).
+
+- **Auth**: PingOne PKCE (`/api/oidc/callback`) — handles fresh login and session refresh on page load.
+- **Agent connection**: `/api/copilotkit` proxies to the AG-UI endpoint, forwarding the `registry_agent_token` cookie as `x-agent-authorization`.
+- **Dashboard state**: `registryRecords` and `metrics` are populated reactively as the agent calls tools. `clearDashboard()` resets both before a new query.
+- **Tool renderers** (`useRenderTool`):
+  - `read_schema` — renders a schema preview card (parses the fastmcp JSON-string envelope)
+  - `read_relationships` — accumulates rows into the registry table + updates metric counters
+  - `check_permission` — renders a ALLOWED / DENIED verdict card with subject/resource details
+- **QuickActions**: trigger canned agent prompts via `agent.addMessage()` + `agent.runAgent()` from `useAgent()`.
+
+### Registry Governor — `agent/`
+
+Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protocol/ag-ui) FastAPI server.
+
+- Runs Gemini via direct API key (no Vertex AI needed — cluster is on AWS).
+- `inject_mcp_auth` `before_agent_callback` reads the `x-agent-authorization` header (forwarded by the frontend), performs Exchange 2 (agent_token → mcp_token), and rebuilds an `McpToolset` for that turn.
+- The MCP token is cached in-process (keyed on agent_token) to avoid redundant PingOne round-trips.
+- Agent instructions enumerate valid permission/relation names from the schema to prevent hallucination.
+
+### SpiceDB MCP Bridge — `k8s/mcp/`
+
+[FastMCP](https://github.com/jlowin/fastmcp) server over streamable HTTP, wrapped in a Starlette app with bearer-token auth middleware.
+
+- On startup, calls SpiceDB to read the live schema and extracts all `relation`/`permission` token names into `VALID_TOKENS`.
+- Pydantic v2 models (`PermissionCheckArgs`, `RelationshipUpdateItem`) validate all inputs. The `permission` and `relation` fields are checked against `VALID_TOKENS`, rejecting invented names with a clear error.
+- `resource_type` and `subject_type` are `Literal` types — FastMCP compiles these to an explicit enum in the JSON Schema sent to the LLM.
+- `subject_id="me"` is resolved server-side from `X-Remote-Agent` / `X-Remote-User` headers injected by PingOne Advanced Services gateway.
+
+---
+
+## Configuration
+
+### Secrets
+
+`k8s/secrets.yaml` is excluded from version control. Create it with:
 
 ```bash
-# 1. Edit the preshared key in k8s/secrets.yaml before applying
-# 2. Run the bootstrap script
+# SpiceDB preshared key + MCP API key
+kubectl create secret generic spicedb-preshared-key \
+  --namespace ping-devops-cprice \
+  --from-literal=presharedKey="$(openssl rand -hex 32)" \
+  --from-literal=mcpApiKey="$(openssl rand -hex 32)" \
+  --dry-run=client -o yaml > k8s/secrets.yaml
+
+# Registry agent secrets
+kubectl create secret generic registry-agent-secrets \
+  --namespace ping-devops-cprice \
+  --from-literal=GOOGLE_API_KEY="<gemini-api-key>" \
+  --from-literal=MCP_BRIDGE_URL="https://notflux-registry-mcp.ping-devops.com/mcp" \
+  --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
+  --from-literal=PINGONE_CLIENT_ID="<client-id>" \
+  --from-literal=PINGONE_CLIENT_SECRET="<client-secret>" \
+  --from-literal=PINGONE_AGENT_AUDIENCE="<aud-claim-for-agent-token>" \
+  --from-literal=PINGONE_MCP_SCOPE="<scope-that-targets-mcp-resource-server>" \
+  --dry-run=client -o yaml >> k8s/secrets.yaml
+
+# Frontend secrets
+kubectl create secret generic registry-frontend-secrets \
+  --namespace ping-devops-cprice \
+  --from-literal=AGENT_ENGINE_URL="<ag-ui-endpoint>" \
+  --from-literal=GOOGLE_GENERATIVE_AI_API_KEY="<key>" \
+  --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
+  --from-literal=PINGONE_CLIENT_ID_FRONTEND="<pkce-client-id>" \
+  --from-literal=PINGONE_CLIENT_SECRET_FRONTEND="<pkce-client-secret>" \
+  --from-literal=PINGONE_AGENT_SCOPE="registry-agent" \
+  --from-literal=NEXT_PUBLIC_PINGONE_ENV_ID="<pingone-env-id>" \
+  --from-literal=NEXT_PUBLIC_PINGONE_CLIENT_ID="<pkce-client-id>" \
+  --dry-run=client -o yaml >> k8s/secrets.yaml
+```
+
+---
+
+## Deployment
+
+### Prerequisites
+
+- Kubernetes cluster with `kubectl` configured
+- `docker` with push access to your registry
+- Secrets applied (see above)
+
+### Bootstrap (first time)
+
+```bash
 chmod +x scripts/bootstrap.sh
 ./scripts/bootstrap.sh
 ```
 
-## Schema
-
-The SpiceDB schema lives in `schema/schema.zed`. It defines four resource types:
-
-| Type | Description |
-|---|---|
-| `user` | A human principal (owner or viewer) |
-| `agent` | An autonomous AI agent |
-| `capability` | A discrete action or tool an agent may use |
-| `namespace` | An organisational boundary grouping agents |
-
-## Configuration
-
-All tuneable values (replica count, image tag, resource limits) are commented inline in `k8s/deployment.yaml`.
-
-The preshared key in `k8s/secrets.yaml` **must** be replaced with a securely generated value before deploying to any non-local environment:
+### Build & deploy all three services
 
 ```bash
-kubectl create secret generic spicedb-preshared-key \
-  --from-literal=presharedKey="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml > k8s/secrets.yaml
+# Frontend
+docker build -t docker.io/pricecs/notflux-registry-frontend:latest ./frontend
+docker push docker.io/pricecs/notflux-registry-frontend:latest
+
+# Agent
+docker build -t docker.io/pricecs/registry-governor:latest ./agent
+docker push docker.io/pricecs/registry-governor:latest
+
+# MCP Bridge
+docker build -t docker.io/pricecs/spicedb-mcp-bridge:latest ./k8s/mcp
+docker push docker.io/pricecs/spicedb-mcp-bridge:latest
+
+# Apply manifests
+kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/mcp-bridge.yaml
+kubectl apply -f k8s/registry-agent.yaml
+kubectl apply -f k8s/frontend.yaml
+
+# Restart to pick up new images
+kubectl rollout restart deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+  -n ping-devops-cprice
+kubectl rollout status deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+  -n ping-devops-cprice --timeout=180s
 ```
+
+### Endpoints (production)
+
+| Service | URL |
+|---|---|
+| Dashboard | `https://notflux-registry.ping-devops.com` |
+| MCP Bridge | `https://notflux-registry-mcp.ping-devops.com/mcp` |
+| Agent (AG-UI) | Internal ClusterIP — accessed via frontend proxy |
+
+---
 
 ## License
 
 MIT
 
----
-
-## MCP Bridge – Natural Language Permission Management
-
-The MCP Bridge is a [FastMCP](https://github.com/jlowin/fastmcp) server that
-exposes SpiceDB as a set of MCP tools. Remote agents (including Google Vertex
-AI Agent Builder) can call these tools over **streamable HTTP transport**
-without any gRPC or SDK requirements.
-
-### Connection details
-
-| Field | Value |
-|---|---|
-| MCP endpoint | `https://notflux-registry-mcp.ping-devops.com/mcp` |
-| Transport | `streamable-http` (MCP spec 2025-03-26) |
-| Auth | `Authorization: Bearer <mcpApiKey>` |
-
-The `mcpApiKey` is stored in the `spicedb-preshared-key` Kubernetes Secret.
-
-### Available tools
-
-| Tool | Purpose |
-|---|---|
-| `write_schema` | Overwrite the full SpiceDB permission schema |
-| `update_relationships` | Create or delete agent → tool / server bindings |
-| `check_permission` | Verify whether an agent may execute a specific tool |
-| `read_schema` | Read the current schema text |
-| `read_relationships` | Query existing relationships with optional filters |
-
----
-
-### `write_schema`
-
-Replaces the entire SpiceDB schema. Use when the permission model itself changes.
-
-```json
-{
-  "tool": "write_schema",
-  "arguments": {
-    "schema": "definition user {}\ndefinition agent {\n    relation owner: user\n}\ndefinition mcp_server {\n    relation authorized_agent: agent\n}\ndefinition mcp_tool {\n    relation parent_server: mcp_server\n    relation direct_agent: agent\n    permission execute = direct_agent + parent_server->authorized_agent\n}"
-  }
-}
-```
-
----
-
-### `update_relationships`
-
-Provisions or revokes `agent → tool` (or `agent → server`) permissions. This is
-the primary tool for dynamic permission management.
-
-**Grant a single tool to an agent** (`mcp_tool.direct_agent`):
-
-```json
-{
-  "tool": "update_relationships",
-  "arguments": {
-    "updates": [
-      {
-        "operation":     "OPERATION_TOUCH",
-        "resource_type": "mcp_tool",
-        "resource_id":   "search_web",
-        "relation":      "direct_agent",
-        "subject_type":  "agent",
-        "subject_id":    "agent-001"
-      }
-    ]
-  }
-}
-```
-
-**Grant an agent access to every tool on an MCP server** (`mcp_server.authorized_agent`):
-
-```json
-{
-  "tool": "update_relationships",
-  "arguments": {
-    "updates": [
-      {
-        "operation":     "OPERATION_TOUCH",
-        "resource_type": "mcp_server",
-        "resource_id":   "research-server",
-        "relation":      "authorized_agent",
-        "subject_type":  "agent",
-        "subject_id":    "agent-001"
-      }
-    ]
-  }
-}
-```
-
-**Revoke a permission** (swap `OPERATION_TOUCH` → `OPERATION_DELETE`):
-
-```json
-{
-  "tool": "update_relationships",
-  "arguments": {
-    "updates": [
-      {
-        "operation":     "OPERATION_DELETE",
-        "resource_type": "mcp_tool",
-        "resource_id":   "search_web",
-        "relation":      "direct_agent",
-        "subject_type":  "agent",
-        "subject_id":    "agent-001"
-      }
-    ]
-  }
-}
-```
-
-Multiple updates can be batched in a single call. SpiceDB applies them
-atomically.
-
----
-
-### Deploying the MCP Bridge
-
-```bash
-# 1. Generate and set the MCP API key in k8s/secrets.yaml
-#    mcpApiKey: "$(openssl rand -hex 32)"
-
-# 2. Build and push the container image
-docker build -t <YOUR_REGISTRY>/spicedb-mcp-bridge:latest ./mcp
-docker push <YOUR_REGISTRY>/spicedb-mcp-bridge:latest
-
-# 3. Update the image: field in k8s/mcp-bridge.yaml, then apply
-kubectl apply -f k8s/secrets.yaml
-kubectl apply -f k8s/mcp-bridge.yaml
-```
