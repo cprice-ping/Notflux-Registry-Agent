@@ -74,11 +74,11 @@ All three application components run in the `ping-devops-cprice` Kubernetes name
 │   ├── registry-agent.yaml     # Agent deployment, service, ingress
 │   ├── mcp-bridge.yaml         # MCP Bridge deployment, service, ingress
 │   ├── patch-p1az.yaml         # PingOne Advanced Services gateway patch
-│   ├── mcp/                    # SpiceDB MCP Bridge source
-│   │   ├── server.py
-│   │   ├── requirements.txt
-│   │   └── Dockerfile
 │   └── secrets.yaml            # ⚠ Not committed — see Configuration below
+├── mcp/                        # SpiceDB MCP Bridge source
+│   ├── server.py               # FastMCP + Starlette app
+│   ├── requirements.txt
+│   └── Dockerfile
 ├── scripts/
 │   └── bootstrap.sh            # One-shot cluster apply script
 └── .gitignore
@@ -165,7 +165,7 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - The MCP token is cached in-process (keyed on agent_token) to avoid redundant PingOne round-trips.
 - Agent instructions enumerate valid permission/relation names from the schema to prevent hallucination.
 
-### SpiceDB MCP Bridge — `k8s/mcp/`
+### SpiceDB MCP Bridge — `mcp/`
 
 [FastMCP](https://github.com/jlowin/fastmcp) server over streamable HTTP, wrapped in a Starlette app with bearer-token auth middleware.
 
@@ -245,7 +245,7 @@ docker build -t docker.io/pricecs/registry-governor:latest ./agent
 docker push docker.io/pricecs/registry-governor:latest
 
 # MCP Bridge
-docker build -t docker.io/pricecs/spicedb-mcp-bridge:latest ./k8s/mcp
+docker build -t docker.io/pricecs/spicedb-mcp-bridge:latest ./mcp
 docker push docker.io/pricecs/spicedb-mcp-bridge:latest
 
 # Apply manifests

@@ -1,5 +1,5 @@
 """
-k8s/mcp/server.py
+mcp/server.py
 
 SpiceDB MCP Bridge – exposes SpiceDB permission management as MCP tools over
 streamable HTTP transport so that remote agents (e.g. Google Vertex AI Agent

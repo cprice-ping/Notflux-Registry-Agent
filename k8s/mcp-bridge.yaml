@@ -13,6 +13,7 @@
 # Prerequisites:
 #   1. Build and push the container image from mcp/Dockerfile:
 #        docker build -t <YOUR_REGISTRY>/spicedb-mcp-bridge:latest ./mcp
+#        (mcp/ is at the repo root)
 #        docker push <YOUR_REGISTRY>/spicedb-mcp-bridge:latest
 #   2. Update the `image:` field in the Deployment below.
 #   3. Ensure k8s/secrets.yaml has been applied (provides the API keys).
