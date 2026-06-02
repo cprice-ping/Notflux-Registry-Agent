@@ -1,0 +1,194 @@
+---
+# k8s/frontend.yaml
+#
+# Deploys the Next.js Registry Console frontend to the ping-devops-cprice
+# namespace alongside SpiceDB and the MCP Bridge.
+#
+# Prerequisites:
+#   1. Build and push the image:
+#        docker build -t docker.io/pricecs/notflux-registry-frontend:latest ./frontend
+#        docker push docker.io/pricecs/notflux-registry-frontend:latest
+#   2. Create the frontend secret (holds sensitive env vars):
+#        kubectl create secret generic registry-frontend-secrets \
+#          --namespace ping-devops-cprice \
+#          --from-literal=GOOGLE_GENERATIVE_AI_API_KEY="<key>" \
+#          --from-literal=AGENT_ENGINE_URL="<vertex-streaming-url>" \
+#          --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
+#          --from-literal=PINGONE_CLIENT_ID_FRONTEND="<client-id>" \
+#          --from-literal=PINGONE_CLIENT_SECRET_FRONTEND="<client-secret>" \
+#          --from-literal=PINGONE_AGENT_SCOPE="registry-agent" \
+#          --from-literal=PINGONE_PERSON_SCOPE="openid profile email" \
+#          --from-literal=NEXT_PUBLIC_PINGONE_ENV_ID="<pingone-env-id>" \
+#          --from-literal=NEXT_PUBLIC_PINGONE_CLIENT_ID="<client-id>"
+#   3. kubectl apply -f k8s/frontend.yaml
+
+###############################################################################
+# Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-frontend
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: registry-frontend
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: registry-frontend
+        app.kubernetes.io/component: frontend
+        app.kubernetes.io/part-of: notflux-registry
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: frontend
+          image: docker.io/pricecs/notflux-registry-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: AGENT_ENGINE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: AGENT_ENGINE_URL
+            - name: GOOGLE_GENERATIVE_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: GOOGLE_GENERATIVE_AI_API_KEY
+            # ── PingOne (server-side) ──────────────────────────────────────
+            - name: PINGONE_ENV_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: PINGONE_ENV_ID
+            - name: PINGONE_CLIENT_ID_FRONTEND
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: PINGONE_CLIENT_ID_FRONTEND
+            - name: PINGONE_CLIENT_SECRET_FRONTEND
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: PINGONE_CLIENT_SECRET_FRONTEND
+            - name: PINGONE_AGENT_SCOPE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: PINGONE_AGENT_SCOPE
+            - name: PINGONE_PERSON_SCOPE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: PINGONE_PERSON_SCOPE
+                  optional: true
+            # ── PingOne (public — Next.js NEXT_PUBLIC_* baked at build time) ──
+            # These are safe to expose; used only in the OIDC redirect.
+            - name: NEXT_PUBLIC_PINGONE_ENV_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: NEXT_PUBLIC_PINGONE_ENV_ID
+            - name: NEXT_PUBLIC_PINGONE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-frontend-secrets
+                  key: NEXT_PUBLIC_PINGONE_CLIENT_ID
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+
+---
+###############################################################################
+# Service
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-frontend
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: registry-frontend
+    app.kubernetes.io/component: frontend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      protocol: TCP
+
+---
+###############################################################################
+# Ingress
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry-frontend
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-frontend
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: notflux-registry
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
+spec:
+  ingressClassName: nginx-public
+  rules:
+    - host: notflux-registry-console.ping-devops.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: registry-frontend
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - notflux-registry-console.ping-devops.com
+      secretName: notflux-registry-console-tls

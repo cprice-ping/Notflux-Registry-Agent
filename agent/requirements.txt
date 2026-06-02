@@ -1,0 +1,6 @@
+google-adk[vertexai]>=1.16.0
+ag_ui_adk>=0.6.5
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+requests>=2.32.0
+mcp>=1.0.0

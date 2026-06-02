@@ -1,0 +1,23 @@
+definition user {}
+
+definition agent {
+    relation owner: user
+    
+    // NEW: Ephemeral hook passed via P1AZ contextual tuples
+    relation active_driver: user
+}
+
+definition mcp_server {
+    relation authorized_agent: agent
+    relation authorized_user: user
+    relation public_to_all_users: user:* permission view_server = authorized_user + public_to_all_users
+    permission agent_can_connect = authorized_agent
+}
+
+definition mcp_tool {
+    relation parent_server: mcp_server
+    relation direct_agent: agent
+    
+    // Level 1 + Level 2 verification combined into one master check
+    permission execute = (direct_agent + parent_server->authorized_agent) & parent_server->view_server
+}

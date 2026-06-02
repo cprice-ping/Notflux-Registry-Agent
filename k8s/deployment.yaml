@@ -1,0 +1,192 @@
+---
+# k8s/deployment.yaml
+#
+# Deploys SpiceDB as the authorization backend for the Agent Registry.
+# Includes:
+#   - Namespace
+#   - SpiceDB Deployment (memory backend for local/dev; swap to CockroachDB or
+#     PostgreSQL for production by changing --datastore-engine and --datastore-conn-uri)
+#   - ClusterIP Service (gRPC :50051, HTTP :8443)
+#
+# Tune the following before going to production:
+#   - replicas          (increase for HA)
+#   - image tag         (pin to a specific SpiceDB release)
+#   - resource limits   (size according to your workload)
+#   - datastore flags   (point at a persistent, replicated datastore)
+#
+
+###############################################################################
+# Namespace
+###############################################################################
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: notflux-registry
+  labels:
+    app.kubernetes.io/part-of: notflux-registry
+
+---
+###############################################################################
+# Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spicedb
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  # Increase to ≥2 for production high-availability.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spicedb
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spicedb
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: notflux-registry
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: spicedb
+          # Pin to a specific release tag in production, e.g. v1.30.0
+          image: authzed/spicedb:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            # ----------------------------------------------------------------
+            # Datastore – memory is suitable for development only.
+            # For production use:
+            #   --datastore-engine=cockroachdb
+            #   --datastore-conn-uri=$(DATASTORE_URI)
+            # ----------------------------------------------------------------
+            - --datastore-engine=memory
+            # Preshared key loaded from the Secret defined in secrets.yaml
+            - --grpc-preshared-key=$(SPICEDB_PRESHARED_KEY)
+            - --http-enabled=true
+            - --telemetry-endpoint=
+          env:
+            - name: SPICEDB_PRESHARED_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spicedb-preshared-key
+                  key: presharedKey
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+            - name: http
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            grpc:
+              port: 50051
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            # Adjust limits based on observed usage in your environment.
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+      securityContext:
+        fsGroup: 1000
+
+---
+###############################################################################
+# Service
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: spicedb
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/component: server
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: 8443
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+
+---
+###############################################################################
+# Ingress – SpiceDB HTTP REST JSON API
+# Routes external HTTP/S traffic from the Notflux Ingress controller to
+# SpiceDB's HTTP gateway so PingGateway and P1AZ can reach the REST JSON API
+# without needing gRPC support.
+#
+# SpiceDB REST API base path: /v1/
+# Example endpoint:           /v1/permissions/check
+#
+# TODO: Replace the host value below with your actual internal DNS name.
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spicedb-http-api
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: notflux-registry
+  annotations:
+    # SpiceDB HTTP gateway serves plain HTTP (--http-no-tls); no backend TLS needed.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
+spec:
+  ingressClassName: nginx-public
+  rules:
+    - host: notflux-registry.ping-devops.com  # TODO: set real hostname
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spicedb
+                port:
+                  name: http
+  tls:
+  - hosts:
+    - notflux-registry.ping-devops.com
+    secretName: notflux-registry-tls

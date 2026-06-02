@@ -1,0 +1,186 @@
+---
+# k8s/registry-agent.yaml
+#
+# Registry Governor AG-UI FastAPI server.
+# Runs ag_ui_adk wrapping the ADK LlmAgent, exposing the AG-UI protocol
+# so the Next.js frontend (CopilotKit) gets full HITL, thinking steps,
+# and generative relationship UI.
+#
+# Prerequisites:
+#   1. Build and push the image:
+#        docker build -t docker.io/pricecs/registry-governor:latest ./agent
+#        docker push docker.io/pricecs/registry-governor:latest
+#
+#   2. Create the secret:
+#        kubectl create secret generic registry-agent-secrets \
+#          --namespace ping-devops-cprice \
+#          --from-literal=GOOGLE_API_KEY="<gemini-api-key>" \
+#          --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
+#          --from-literal=PINGONE_CLIENT_ID="<client-id>" \
+#          --from-literal=PINGONE_CLIENT_SECRET="<client-secret>" \
+#          --from-literal=PINGONE_AGENT_AUDIENCE="<aud-claim>" \
+#          --from-literal=PINGONE_MCP_SCOPE="<mcp-scope>"
+#
+#   3. kubectl apply -f k8s/registry-agent.yaml
+
+###############################################################################
+# Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-agent
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: registry-agent
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: registry-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: notflux-registry
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent
+          image: docker.io/pricecs/registry-governor:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # ADK uses GOOGLE_API_KEY for direct Gemini API access.
+            # No GOOGLE_CLOUD_PROJECT / Vertex needed — cluster is on AWS.
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: GOOGLE_API_KEY
+            - name: MCP_BRIDGE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: MCP_BRIDGE_URL
+            # PingOne Exchange 3: agent_token → gateway_token
+            - name: PINGONE_ENV_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_ENV_ID
+            - name: PINGONE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_CLIENT_ID
+            - name: PINGONE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_CLIENT_SECRET
+            - name: PINGONE_AGENT_AUDIENCE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_AGENT_AUDIENCE
+            - name: PINGONE_MCP_SCOPE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_MCP_SCOPE
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+###############################################################################
+# Service
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-agent
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  selector:
+    app.kubernetes.io/name: registry-agent
+    app.kubernetes.io/component: agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+###############################################################################
+# Ingress
+# PingGateway routes inbound traffic to this service.
+# The frontend's CopilotKit remoteEndpoints URL points here.
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry-agent
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: notflux-registry
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # AG-UI streams SSE — disable buffering
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx-public
+  tls:
+    - hosts:
+        - notflux-registry-agent.ping-devops.com
+      secretName: notflux-registry-agent-tls
+  rules:
+    - host: notflux-registry-agent.ping-devops.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: registry-agent
+                port:
+                  name: http

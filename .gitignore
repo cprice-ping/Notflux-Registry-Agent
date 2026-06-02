@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Next.js
+frontend/.next/
+frontend/out/
+
+# Environment / secrets
+.env
+.env.local
+.env*.local
+*.env
+
+# Build artifacts
+frontend/build/
+
+# Kubernetes secrets (never commit real keys)
+k8s/secrets.yaml
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
+# Backup / temp files
+*~
