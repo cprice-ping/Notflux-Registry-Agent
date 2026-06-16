@@ -1,0 +1,172 @@
+---
+# k8s/registry-pip.yaml
+#
+# Deploys the Registry PIP (Policy Information Point) microservice.
+#
+# This service provides:
+#   - MCP interface (/mcp)  — for the Conductor Agent to register/resolve entities
+#   - REST interface (/v1/entities/{id}) — for P1AZ high-frequency entity resolution
+#
+# Prerequisites:
+#   1. Build and push the container image:
+#        docker build -t docker.io/pricecs/registry-pip:latest ./registry_service
+#        docker push docker.io/pricecs/registry-pip:latest
+#
+#   2. Create the secret:
+#        kubectl create secret generic registry-pip-secrets \
+#          --namespace ping-devops-cprice \
+#          --from-literal=DATABASE_URL="postgresql+asyncpg://user:pass@postgres.ping-devops-cprice.svc.cluster.local:5432/registry" \
+#          --from-literal=MCP_API_KEY="$(openssl rand -hex 32)"
+#
+#   3. kubectl apply -f k8s/registry-pip.yaml
+
+###############################################################################
+# Deployment
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry-pip
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-pip
+    app.kubernetes.io/component: pip
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: registry-pip
+      app.kubernetes.io/component: pip
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: registry-pip
+        app.kubernetes.io/component: pip
+        app.kubernetes.io/part-of: notflux-registry
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: registry-pip
+          image: docker.io/pricecs/registry-pip:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # postgresql+asyncpg:// connection string to the cluster PostgreSQL.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-pip-secrets
+                  key: DATABASE_URL
+            # Bearer token the Conductor Agent must present to the MCP endpoint.
+            - name: MCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-pip-secrets
+                  key: MCP_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+      securityContext:
+        fsGroup: 1000
+
+---
+###############################################################################
+# Service
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry-pip
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-pip
+    app.kubernetes.io/component: pip
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: registry-pip
+    app.kubernetes.io/component: pip
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+
+---
+###############################################################################
+# Ingress
+#
+# Exposes two paths on a dedicated hostname:
+#   /mcp   — MCP endpoint for the Conductor Agent (Bearer token auth)
+#   /v1    — REST endpoint for P1AZ (Kong OIDC/JWT auth)
+#
+# The long proxy timeouts on /mcp are required for SSE streaming.
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry-pip
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-pip
+    app.kubernetes.io/component: pip
+    app.kubernetes.io/part-of: notflux-registry
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
+    # SSE streaming for the MCP protocol requires long-lived connections.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx-public
+  rules:
+    - host: notflux-registry-pip.ping-devops.com
+      http:
+        paths:
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: registry-pip
+                port:
+                  name: http
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: registry-pip
+                port:
+                  name: http
+  tls:
+    - hosts:
+        - notflux-registry-pip.ping-devops.com
+      secretName: notflux-registry-pip-tls
