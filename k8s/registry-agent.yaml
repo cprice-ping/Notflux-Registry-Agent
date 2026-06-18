@@ -96,6 +96,17 @@ spec:
                 secretKeyRef:
                   name: registry-agent-secrets
                   key: PINGONE_MCP_SCOPE
+            # Registry-PIP MCP endpoint — static bearer token, no per-turn exchange.
+            - name: REGISTRY_PIP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: REGISTRY_PIP_URL
+            - name: REGISTRY_PIP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: REGISTRY_PIP_API_KEY
           readinessProbe:
             httpGet:
               path: /healthz

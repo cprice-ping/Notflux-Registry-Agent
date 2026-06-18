@@ -9,44 +9,53 @@ Agents and MCP servers are modeled as first-class resources. An ADK-based govern
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Browser                                                        │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Next.js Dashboard  (CopilotKit v2)                       │  │
-│  │  • Reactive relationship table & metrics cards            │  │
-│  │  • Inline tool renderers (schema, relationships, checks)  │  │
-│  │  • PingOne PKCE login + token exchange                    │  │
-│  └────────────────────┬──────────────────────────────────────┘  │
-└───────────────────────│─────────────────────────────────────────┘
-                        │  AG-UI (CopilotKit protocol)
-                        ▼
-         ┌──────────────────────────────┐
-         │  Registry Governor           │
-         │  (Google ADK + ag_ui_adk)    │
-         │  • LlmAgent (Gemini)         │
-         │  • Per-turn MCP token exch.  │
-         └──────────────┬───────────────┘
-                        │  MCP streamable-HTTP
-                        ▼
-         ┌──────────────────────────────┐
-         │  SpiceDB MCP Bridge          │
-         │  (FastMCP + Starlette)       │
-         │  • read/write_schema         │
-         │  • update_relationships      │
-         │  • check_permission          │
-         │  • read_relationships        │
-         │  • Live schema token check   │
-         └──────────────┬───────────────┘
-                        │  SpiceDB HTTP REST API
-                        ▼
-         ┌──────────────────────────────┐
-         │  SpiceDB                     │
-         │  Zanzibar-compatible         │
-         │  permission graph            │
-         └──────────────────────────────┘
+ Browser
+ ┌──────────────────────────────────────────────────────────────────┐
+ │  Next.js Dashboard  (CopilotKit v2)                             │
+ │  • Reactive relationship table & metrics cards                  │
+ │  • Inline tool renderers (schema, relationships, checks)        │
+ │  • PingOne PKCE login + token exchange                          │
+ └─────────────────────────┬────────────────────────────────────────┘
+                           │  AG-UI (CopilotKit protocol)
+                           ▼
+          ┌────────────────────────────────┐
+          │  Registry Governor             │
+          │  (Google ADK + ag_ui_adk)      │
+          │  LlmAgent (Gemini)             │
+          │  Per-turn MCP token exchange   │
+          └──────────┬─────────────────────┘
+                     │  MCP (two toolsets per turn)
+          ┌──────────┴─────────────┐
+          ▼                        ▼
+ ┌─────────────────────┐  ┌──────────────────────────────┐
+ │ SpiceDB MCP Bridge  │  │ Registry PIP  (FastMCP)      │
+ │ (FastMCP+Starlette) │  │ • register_entity            │
+ │ • read/write_schema │  │ • resolve_entity             │
+ │ • update_relations  │  │ • list_entities              │
+ │ • check_permission  │  │ • find_entity_by_name        │
+ │ • read_relations    │  │ Static Bearer token auth     │
+ │ Live schema valid.  │  └──────────┬───────────────────┘
+ └──────────┬──────────┘             │  SQLAlchemy async
+            │  SpiceDB REST API      ▼
+            ▼               ┌────────────────────┐
+  ┌──────────────────┐      │  PostgreSQL 16      │
+  │  SpiceDB         │      │  entity name→ID     │
+  │  Zanzibar-compat │      └────────┬────────────┘
+  │  permission graph│               │  GET /v1/entities
+  └──────────────────┘               ▼
+                           ┌──────────────────────┐
+                           │  Kong (db-less)       │
+                           │  ping-auth on /v1     │
+                           │  → P1AZ Hybrid GW     │
+                           └──────────────────────┘
 ```
 
-All three application components run in the `ping-devops-cprice` Kubernetes namespace, co-located with SpiceDB.
+**Auth gateway split:**
+- SpiceDB MCP Bridge is fronted by **PingGateway** (PingOne Advanced Services) — handles per-turn token exchange for the Governor agent.
+- Registry PIP REST (`/v1`) is fronted by **Kong** with the `ping-auth` plugin wired to a **PingOne Authorize Hybrid Gateway**, giving P1AZ ABAC control over entity resolution.
+- Registry PIP MCP (`/mcp`) uses a static bearer token validated in-process — no gateway needed for agent-to-agent calls.
+
+All components run in the `ping-devops-cprice` Kubernetes namespace.
 
 ---
 
@@ -64,8 +73,22 @@ All three application components run in the `ping-devops-cprice` Kubernetes name
 │   │       └── oidc/callback/  # PingOne OIDC code + token exchange
 │   └── Dockerfile
 ├── agent/                      # Registry Governor (ADK agent)
-│   ├── agent.py                # LlmAgent definition + PingOne token exchange
+│   ├── agent.py                # LlmAgent + token exchange + two MCP toolsets
 │   ├── server.py               # AG-UI FastAPI server entry point
+│   ├── requirements.txt
+│   └── Dockerfile
+├── mcp/                        # SpiceDB MCP Bridge source
+│   ├── server.py               # FastMCP + Starlette + Pydantic v2 validation
+│   ├── requirements.txt
+│   └── Dockerfile
+├── registry_service/           # Registry PIP microservice
+│   ├── app/
+│   │   ├── main.py             # Combined Starlette ASGI app (/mcp + /v1 + /healthz)
+│   │   ├── mcp_server.py       # FastMCP tools (register, resolve, list, find)
+│   │   ├── rest_api.py         # FastAPI REST router (GET /v1/entities)
+│   │   ├── models.py           # SQLAlchemy Entity ORM model
+│   │   ├── schemas.py          # Pydantic response schemas
+│   │   └── database.py         # Async SQLAlchemy engine + session factory
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── k8s/
@@ -73,12 +96,10 @@ All three application components run in the `ping-devops-cprice` Kubernetes name
 │   ├── frontend.yaml           # Frontend deployment, service, ingress
 │   ├── registry-agent.yaml     # Agent deployment, service, ingress
 │   ├── mcp-bridge.yaml         # MCP Bridge deployment, service, ingress
+│   ├── registry-pip.yaml       # Registry PIP deployment, service, ingress
+│   ├── registry-pip-postgres.yaml  # In-cluster PostgreSQL StatefulSet
 │   ├── patch-p1az.yaml         # PingOne Advanced Services gateway patch
 │   └── secrets.yaml            # ⚠ Not committed — see Configuration below
-├── mcp/                        # SpiceDB MCP Bridge source
-│   ├── server.py               # FastMCP + Starlette app
-│   ├── requirements.txt
-│   └── Dockerfile
 ├── scripts/
 │   └── bootstrap.sh            # One-shot cluster apply script
 └── .gitignore
@@ -161,9 +182,12 @@ Next.js 15 app using **CopilotKit v2** (`@copilotkit/react-core/v2`).
 Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protocol/ag-ui) FastAPI server.
 
 - Runs Gemini via direct API key (no Vertex AI needed — cluster is on AWS).
-- `inject_mcp_auth` `before_agent_callback` reads the `x-agent-authorization` header (forwarded by the frontend), performs Exchange 2 (agent_token → mcp_token), and rebuilds an `McpToolset` for that turn.
+- `inject_mcp_auth` `before_agent_callback` reads the `x-agent-authorization` header, performs Exchange 2 (agent_token → mcp_token), then rebuilds **two** `McpToolset` instances for that turn:
+  1. **SpiceDB MCP Bridge** — authenticated with the per-turn exchanged PingOne token.
+  2. **Registry PIP** — authenticated with a static `REGISTRY_PIP_API_KEY` bearer token (no per-turn exchange).
 - The MCP token is cached in-process (keyed on agent_token) to avoid redundant PingOne round-trips.
-- Agent instructions enumerate valid permission/relation names from the schema to prevent hallucination.
+- Agent instructions enumerate valid permission/relation names and describe the two-step onboarding workflow.
+- When an admin refers to an entity by name, the agent calls `find_entity_by_name` first to resolve the ID before calling any SpiceDB tools.
 
 ### SpiceDB MCP Bridge — `mcp/`
 
@@ -174,33 +198,81 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - `resource_type` and `subject_type` are `Literal` types — FastMCP compiles these to an explicit enum in the JSON Schema sent to the LLM.
 - `subject_id="me"` is resolved server-side from `X-Remote-Agent` / `X-Remote-User` headers injected by PingOne Advanced Services gateway.
 
+### Registry PIP — `registry_service/`
+
+FastMCP + FastAPI microservice backed by PostgreSQL. The **name-to-ID source of truth** for all entities in the cluster.
+
+**MCP tools** (consumed by the Governor agent and any MCP client):
+
+| Tool | Purpose |
+|---|---|
+| `register_entity(id, type, name, owner_guid, metadata?)` | Upsert an entity. The `id` must match the object ID used in SpiceDB. |
+| `resolve_entity(id)` | Look up a single entity by its stable ID. |
+| `list_entities(type?)` | Browse all registered entities, optionally filtered by type. Use when the admin doesn't know the ID. |
+| `find_entity_by_name(name, type?)` | Case-insensitive substring search by human-readable name. Breaks the ID catch-22 — ask by name, get the ID back. |
+
+**REST endpoints** (consumed by P1AZ during authorization decisions):
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/entities/{id}` | Resolve a single entity by ID (high-frequency PK lookup for P1AZ). |
+| `GET` | `/v1/entities?type=agent&name=notflux` | List / search entities by type and/or name substring. |
+| `GET` | `/healthz` | Unauthenticated liveness check. |
+
+The `/mcp` path uses static bearer token auth validated in-process. The `/v1` path is fronted by Kong + PingOne Authorize.
+
+### Kong + PingOne Authorize Hybrid Gateway
+
+Kong (db-less, custom image with `ping-auth` plugin) fronts the Registry PIP REST interface.
+
+- Two declarative routes: `/v1` (with `ping-auth` plugin) and `/mcp` (no plugin — bearer token handled in-process).
+- The `ping-auth` plugin is **scoped to the `/v1` route only** so MCP streaming is not interrupted.
+- The PingOne Authorize Hybrid Gateway connects to PingOne env `NotFlux` and evaluates ABAC policies on REST requests.
+- Kong deployed as `notflux-registry-api-kong` via Helm (declarative ConfigMap). Hybrid Gateway deployed as `notflux-registry-api-p1az-gateway`.
+
 ---
 
 ## Configuration
 
 ### Secrets
 
-`k8s/secrets.yaml` is excluded from version control. Create it with:
+`k8s/secrets.yaml` is excluded from version control. Create each secret with `kubectl create secret`.
 
 ```bash
-# SpiceDB preshared key + MCP API key
+# SpiceDB preshared key + MCP bridge bearer token
 kubectl create secret generic spicedb-preshared-key \
   --namespace ping-devops-cprice \
   --from-literal=presharedKey="$(openssl rand -hex 32)" \
-  --from-literal=mcpApiKey="$(openssl rand -hex 32)" \
-  --dry-run=client -o yaml > k8s/secrets.yaml
+  --from-literal=mcpApiKey="$(openssl rand -hex 32)"
 
-# Registry agent secrets
+# Registry PIP — Postgres credentials
+kubectl create secret generic registry-pip-postgres-secrets \
+  --namespace ping-devops-cprice \
+  --from-literal=POSTGRES_USER="registry_pip" \
+  --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)" \
+  --from-literal=POSTGRES_DB="registry"
+
+# Registry PIP — app secrets (use the password set above)
+kubectl create secret generic registry-pip-secrets \
+  --namespace ping-devops-cprice \
+  --from-literal=DATABASE_URL="postgresql+asyncpg://registry_pip:<password>@registry-postgres.ping-devops-cprice.svc.cluster.local:5432/registry" \
+  --from-literal=MCP_API_KEY="$(openssl rand -hex 32)"
+
+# Registry Agent secrets
+# REGISTRY_PIP_API_KEY: copy from registry-pip-secrets:
+#   kubectl get secret registry-pip-secrets -n ping-devops-cprice \
+#     -o jsonpath='{.data.MCP_API_KEY}' | base64 -d
 kubectl create secret generic registry-agent-secrets \
   --namespace ping-devops-cprice \
   --from-literal=GOOGLE_API_KEY="<gemini-api-key>" \
-  --from-literal=MCP_BRIDGE_URL="https://notflux-registry-mcp.ping-devops.com/mcp" \
+  --from-literal=MCP_BRIDGE_URL="https://notflux-registry.notflux-priv-gateway.ping-devops.com/mcp" \
   --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
   --from-literal=PINGONE_CLIENT_ID="<client-id>" \
   --from-literal=PINGONE_CLIENT_SECRET="<client-secret>" \
   --from-literal=PINGONE_AGENT_AUDIENCE="<aud-claim-for-agent-token>" \
   --from-literal=PINGONE_MCP_SCOPE="<scope-that-targets-mcp-resource-server>" \
-  --dry-run=client -o yaml >> k8s/secrets.yaml
+  --from-literal=REGISTRY_PIP_URL="https://notflux-registry-pip.ping-devops.com/mcp" \
+  --from-literal=REGISTRY_PIP_API_KEY="<pip-mcp-api-key>"
 
 # Frontend secrets
 kubectl create secret generic registry-frontend-secrets \
@@ -212,8 +284,7 @@ kubectl create secret generic registry-frontend-secrets \
   --from-literal=PINGONE_CLIENT_SECRET_FRONTEND="<pkce-client-secret>" \
   --from-literal=PINGONE_AGENT_SCOPE="registry-agent" \
   --from-literal=NEXT_PUBLIC_PINGONE_ENV_ID="<pingone-env-id>" \
-  --from-literal=NEXT_PUBLIC_PINGONE_CLIENT_ID="<pkce-client-id>" \
-  --dry-run=client -o yaml >> k8s/secrets.yaml
+  --from-literal=NEXT_PUBLIC_PINGONE_CLIENT_ID="<pkce-client-id>"
 ```
 
 ---
@@ -233,42 +304,86 @@ chmod +x scripts/bootstrap.sh
 ./scripts/bootstrap.sh
 ```
 
-### Build & deploy all three services
+### Build & deploy all services
 
 ```bash
 # Frontend
 docker build -t docker.io/pricecs/notflux-registry-frontend:latest ./frontend
 docker push docker.io/pricecs/notflux-registry-frontend:latest
 
-# Agent
+# Registry Governor agent
 docker build -t docker.io/pricecs/registry-governor:latest ./agent
 docker push docker.io/pricecs/registry-governor:latest
 
-# MCP Bridge
+# SpiceDB MCP Bridge
 docker build -t docker.io/pricecs/spicedb-mcp-bridge:latest ./mcp
 docker push docker.io/pricecs/spicedb-mcp-bridge:latest
 
-# Apply manifests
-kubectl apply -f k8s/secrets.yaml
+# Registry PIP
+docker build -t docker.io/pricecs/registry-pip:latest ./registry_service
+docker push docker.io/pricecs/registry-pip:latest
+
+# Apply manifests (Postgres must be Running before PIP)
 kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/registry-pip-postgres.yaml
+kubectl apply -f k8s/registry-pip.yaml
 kubectl apply -f k8s/mcp-bridge.yaml
 kubectl apply -f k8s/registry-agent.yaml
 kubectl apply -f k8s/frontend.yaml
 
-# Restart to pick up new images
-kubectl rollout restart deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+# Restart deployments to pick up new images
+kubectl rollout restart \
+  deployment/registry-frontend \
+  deployment/registry-agent \
+  deployment/spicedb-mcp-bridge \
+  deployment/registry-pip \
   -n ping-devops-cprice
-kubectl rollout status deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+kubectl rollout status \
+  deployment/registry-frontend \
+  deployment/registry-agent \
+  deployment/spicedb-mcp-bridge \
+  deployment/registry-pip \
   -n ping-devops-cprice --timeout=180s
 ```
 
 ### Endpoints (production)
 
-| Service | URL |
-|---|---|
-| Dashboard | `https://notflux-registry.ping-devops.com` |
-| MCP Bridge | `https://notflux-registry-mcp.ping-devops.com/mcp` |
-| Agent (AG-UI) | Internal ClusterIP — accessed via frontend proxy |
+| Service | URL | Auth |
+|---|---|---|
+| Dashboard | `https://notflux-registry.ping-devops.com` | PingOne PKCE |
+| SpiceDB MCP Bridge | `https://notflux-registry.notflux-priv-gateway.ping-devops.com/mcp` | PingGateway token exchange |
+| Registry PIP (MCP) | `https://notflux-registry-pip.ping-devops.com/mcp` | Static Bearer (`REGISTRY_PIP_API_KEY`) |
+| Registry PIP (REST) | `https://notflux-registry-api.ping-devops.com/v1/entities` | Kong → PingOne Authorize |
+| Agent (AG-UI) | Internal ClusterIP | Via frontend `/api/copilotkit` proxy |
+
+---
+
+## Entity Onboarding Workflow
+
+Every new agent, user, or MCP server must be registered in **both** systems to be fully operational:
+
+```
+STEP 1 — Register in Registry PIP (creates the name-to-ID record):
+  register_entity(
+    id="<stable-resource-id>",   ← Vertex path, PingOne GUID, or any opaque string
+    type="agent",                ← agent | user | mcp_server | mcp_tool
+    name="My Agent Display Name",
+    owner_guid="<owner-pingone-guid>"
+  )
+
+STEP 2 — Grant permissions in SpiceDB (use the SAME id):
+  update_relationships(relationships=[
+    { "resource_type": "agent",
+      "resource_id":   "<stable-resource-id>",
+      "relation":      "owner",
+      "subject_type":  "user",
+      "subject_id":    "<owner-subject-id>" }
+  ], operation="OPERATION_TOUCH")
+```
+
+> An entity in SpiceDB but not in Registry PIP has permissions but no resolvable name.
+> An entity in Registry PIP but not SpiceDB has a name but no access grants.
+> Both are needed for a fully functional, auditable entity.
 
 ---
 

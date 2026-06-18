@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastmcp import FastMCP
+from sqlalchemy import func, select
 
 from .database import AsyncSessionLocal
 from .models import Entity
@@ -22,6 +23,8 @@ mcp = FastMCP(
         "Registry Policy Information Point. "
         "Use register_entity to create or update entity records (agents, MCP servers, users, etc.). "
         "Use resolve_entity to look up a canonical entity record by its stable ID. "
+        "Use list_entities to browse all registered entities (optionally filtered by type) when you do not know the ID. "
+        "Use find_entity_by_name to search by human-readable name when an admin asks about an entity by name rather than ID. "
         "Entity IDs are the same identifiers used in SpiceDB relationship tuples."
     ),
 )
@@ -99,3 +102,70 @@ async def resolve_entity(id: str) -> dict[str, Any]:
             "owner_guid": entity.owner_guid,
             "metadata": entity.entity_metadata or {},
         }
+
+
+@mcp.tool()
+async def list_entities(type: str | None = None) -> list[dict[str, Any]]:
+    """
+    List all registered entities, optionally filtered by type.
+
+    Use this to browse what is in the Registry without needing to know IDs
+    upfront. Returns a list of entity records sorted by name.
+
+    Args:
+        type: Optional filter — one of "agent", "user", "mcp_server",
+              "mcp_tool". If omitted, all entities are returned.
+
+    Returns a list of dicts, each with id, type, name, owner_guid, metadata.
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = select(Entity).order_by(Entity.name)
+        if type is not None:
+            stmt = stmt.where(Entity.type == type)
+        rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": e.id,
+            "type": e.type,
+            "name": e.name,
+            "owner_guid": e.owner_guid,
+            "metadata": e.entity_metadata or {},
+        }
+        for e in rows
+    ]
+
+
+@mcp.tool()
+async def find_entity_by_name(name: str, type: str | None = None) -> list[dict[str, Any]]:
+    """
+    Search for entities whose name contains the given string (case-insensitive).
+
+    Use this when an admin asks about an entity by its human-readable name
+    rather than by ID — e.g. "Tell me about the NotFlux Agent".
+
+    Args:
+        name: Substring to search for within the entity name field.
+        type: Optional type filter — one of "agent", "user", "mcp_server",
+              "mcp_tool". Narrows results to a single entity class.
+
+    Returns a list of matching entity dicts (may be empty if nothing matches).
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(Entity)
+            .where(func.lower(Entity.name).contains(name.lower()))
+            .order_by(Entity.name)
+        )
+        if type is not None:
+            stmt = stmt.where(Entity.type == type)
+        rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": e.id,
+            "type": e.type,
+            "name": e.name,
+            "owner_guid": e.owner_guid,
+            "metadata": e.entity_metadata or {},
+        }
+        for e in rows
+    ]

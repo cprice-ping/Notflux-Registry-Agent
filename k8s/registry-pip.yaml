@@ -15,7 +15,7 @@
 #   2. Create the secret:
 #        kubectl create secret generic registry-pip-secrets \
 #          --namespace ping-devops-cprice \
-#          --from-literal=DATABASE_URL="postgresql+asyncpg://user:pass@postgres.ping-devops-cprice.svc.cluster.local:5432/registry" \
+#          --from-literal=DATABASE_URL="postgresql+asyncpg://registry_pip:<password>@registry-postgres.ping-devops-cprice.svc.cluster.local:5432/registry" \
 #          --from-literal=MCP_API_KEY="$(openssl rand -hex 32)"
 #
 #   3. kubectl apply -f k8s/registry-pip.yaml
