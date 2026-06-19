@@ -24,6 +24,28 @@
 #   3. kubectl apply -f k8s/registry-agent.yaml
 
 ###############################################################################
+# ServiceAccount — sovereign identity for the agent loop.
+# The kubelet projects a short-lived OIDC token (audience: davinci-sts) into
+# the pod filesystem; the agent presents it to PingOne as a JWT Bearer
+# assertion (RFC 7523) instead of a static client secret.
+###############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notflux-registry-agent
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: registry-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: notflux-registry
+  annotations:
+    # If you later enable IRSA (IAM Roles for Service Accounts) on EKS, add:
+    # eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/<role-name>
+    pingone.com/purpose: "notflux-registry-agent token exchange"
+automountServiceAccountToken: false  # we use an explicit projected token below
+
+---
+###############################################################################
 # Deployment
 ###############################################################################
 apiVersion: apps/v1
@@ -49,6 +71,18 @@ spec:
         app.kubernetes.io/part-of: notflux-registry
     spec:
       terminationGracePeriodSeconds: 30
+      # Attach the sovereign SA identity to every pod replica.
+      serviceAccountName: notflux-registry-agent
+      volumes:
+        # Kubelet auto-mints a short-lived OIDC token (audience: davinci-sts).
+        # Rotated automatically before expiry — no secret management needed.
+        - name: davinci-sts-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: davinci-sts
+                  expirationSeconds: 3600
+                  path: davinci-token
       containers:
         - name: agent
           image: docker.io/pricecs/registry-governor:latest
@@ -113,6 +147,24 @@ spec:
                 secretKeyRef:
                   name: registry-agent-secrets
                   key: REGISTRY_PIP_API_KEY
+            # Path to the projected SA token — read at runtime for JWT Bearer assertion.
+            - name: PINGONE_SA_TOKEN_PATH
+              value: /var/run/secrets/tokens/davinci-token
+            # DaVinci policy execution URL + API key for the token exchange flow.
+            - name: DAVINCI_POLICY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: DAVINCI_POLICY_URL
+            - name: DAVINCI_POLICY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: DAVINCI_POLICY_API_KEY
+          volumeMounts:
+            - name: davinci-sts-token
+              mountPath: /var/run/secrets/tokens
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz

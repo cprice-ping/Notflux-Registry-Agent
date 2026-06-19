@@ -43,7 +43,6 @@ import logging
 import os
 import time
 from typing import Optional
-from urllib.parse import quote
 
 import requests as http_requests
 from google.adk.agents import llm_agent
@@ -62,12 +61,15 @@ WEATHER_URL = os.getenv('WEATHER_MCP_URL', 'https://notflux-gateway.ping-devops.
 REGISTRY_PIP_URL     = os.getenv('REGISTRY_PIP_URL', 'https://notflux-registry-pip.ping-devops.com/mcp')
 _REGISTRY_PIP_API_KEY = os.getenv('REGISTRY_PIP_API_KEY', '')
 
-# PingOne Exchange 2 — agent_token → mcp_token
-_PINGONE_ENV_ID         = os.getenv('PINGONE_ENV_ID', '')
-_PINGONE_CLIENT_ID      = os.getenv('PINGONE_CLIENT_ID', '')
-_PINGONE_CLIENT_SECRET  = os.getenv('PINGONE_CLIENT_SECRET', '')
+# DaVinci-based token exchange — actor_token (k8s SA) + subject_token (human OIDC) → mcp_token
+_DAVINCI_POLICY_URL     = os.getenv(
+    'DAVINCI_POLICY_URL',
+    'https://orchestrate-api.pingone.com/v1/company/59bb6a66-e76e-490c-b83a-884c50423da4'
+    '/policy/cba6c296e71c5f569526fc99dc1a7be2/start',
+)
+_DAVINCI_POLICY_API_KEY = os.getenv('DAVINCI_POLICY_API_KEY', '')
 _PINGONE_AGENT_AUDIENCE = os.getenv('PINGONE_AGENT_AUDIENCE', '')
-_PINGONE_MCP_SCOPE      = os.getenv('PINGONE_MCP_SCOPE', '')
+_SA_TOKEN_PATH          = os.getenv('PINGONE_SA_TOKEN_PATH', '/var/run/secrets/tokens/davinci-token')
 
 # Simple in-process cache: raw_agent_token → (mcp_token, expires_at)
 _mcp_token_cache: dict[str, tuple[str, float]] = {}
@@ -77,28 +79,34 @@ _mcp_token_cache: dict[str, tuple[str, float]] = {}
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_vertex_agent_id() -> str:
-    """Return the Vertex Agent Engine resource path to embed as agent_id claim."""
-    project   = os.getenv('GCP_PROJECT') or os.getenv('GOOGLE_CLOUD_PROJECT') or os.getenv('CLOUD_ML_PROJECT_ID', '')
-    location  = os.getenv('GCP_LOCATION') or os.getenv('GOOGLE_CLOUD_LOCATION') or os.getenv('CLOUD_ML_REGION', 'us-west1')
-    engine_id = os.getenv('VERTEX_REASONING_ENGINE_ID', '')
-    if project and engine_id:
-        return f'projects/{project}/locations/{location}/reasoningEngines/{engine_id}'
-    if project:
-        return f'projects/{project}/locations/{location}/reasoningEngines/registry-governor'
-    return ''
+def _read_sa_token() -> str:
+    """Read the projected k8s Service Account token from disk.
+
+    The kubelet rotates this automatically; always read fresh from disk
+    rather than caching it — the file is in memory (tmpfs) so the read
+    is cheap.
+    """
+    if not os.path.exists(_SA_TOKEN_PATH):
+        raise RuntimeError(
+            f"K8s Projected Token missing - check deployment manifest allocation "
+            f"(expected at {_SA_TOKEN_PATH})"
+        )
+    with open(_SA_TOKEN_PATH, 'r') as f:
+        return f.read().strip()
 
 
 def _exchange_for_mcp_token(agent_token: str) -> str:
-    """RFC 8693 token exchange: agent_token → mcp_token (aud = MCP bridge).
+    """DaVinci-based token exchange: subject_token (human) + actor_token (k8s SA) → mcp_token.
 
-    Falls back to INTERNAL_M2M_KEY when PingOne env vars are not configured.
+    Calls the DaVinci policy flow instead of the PingOne /as/token endpoint so
+    the actor_token (third-party k8s OIDC JWT) can be validated and embedded as
+    the verified workload identity before PingOne mints the outbound access_token.
     """
-    if not all([_PINGONE_ENV_ID, _PINGONE_CLIENT_ID, _PINGONE_CLIENT_SECRET, _PINGONE_MCP_SCOPE]):
-        logging.warning('exchange_for_mcp: PingOne env vars not configured — using agent_token directly')
+    if not _DAVINCI_POLICY_API_KEY:
+        logging.warning('exchange_for_mcp: DAVINCI_POLICY_API_KEY not set — using agent_token directly')
         return agent_token
 
-    # Validate aud claim before the round-trip to PingOne.
+    # Validate aud claim on the incoming human token before the round-trip.
     if _PINGONE_AGENT_AUDIENCE:
         try:
             parts  = agent_token.split(".")
@@ -117,36 +125,38 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
         logging.debug("exchange_for_mcp: cache hit")
         return cached[0]
 
-    agent_id  = _get_vertex_agent_id()
-    token_url = f"https://auth.pingone.com/{_PINGONE_ENV_ID}/as/token"
-    basic_cred = base64.b64encode(
-        f"{quote(_PINGONE_CLIENT_ID)}:{quote(_PINGONE_CLIENT_SECRET)}".encode()
-    ).decode()
+    # Read the SA token fresh each cache-miss (kubelet rotates it on disk).
+    actor_token = _read_sa_token()
 
-    body: dict[str, str] = {
-        "grant_type":           "urn:ietf:params:oauth:grant-type:token-exchange",
-        "subject_token":        agent_token,
-        "subject_token_type":   "urn:ietf:params:oauth:token-type:access_token",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "scope":                _PINGONE_MCP_SCOPE,
-    }
-    if agent_id:
-        body["agent_id"] = agent_id
-
-    logging.info(f"exchange_for_mcp: POST {token_url} client_id={_PINGONE_CLIENT_ID} scope={_PINGONE_MCP_SCOPE} agent_id={agent_id or '(none)'}")
+    logging.info(f"exchange_for_mcp: POST {_DAVINCI_POLICY_URL}")
     resp = http_requests.post(
-        token_url,
-        data=body,
-        headers={"Authorization": f"Basic {basic_cred}"},
+        _DAVINCI_POLICY_URL,
+        json={
+            "actor_token":   actor_token,
+            "subject_token": agent_token,
+        },
+        headers={
+            "Content-Type": "application/json",
+            "X-SK-API-Key": _DAVINCI_POLICY_API_KEY,
+        },
         timeout=10,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"exchange_for_mcp: DaVinci policy returned {resp.status_code} — "
+            f"aborting gateway routing. body={resp.text[:200]!r}"
+        )
 
-    result     = resp.json()
+    result = resp.json()
+    if not result.get("success"):
+        raise RuntimeError(
+            f"exchange_for_mcp: DaVinci policy denied — "
+            f"aborting gateway routing. body={str(result)[:200]!r}"
+        )
     mcp_token  = result["access_token"]
     expires_in = int(result.get("expires_in", 3600))
     _mcp_token_cache[agent_token] = (mcp_token, time.time() + expires_in - 30)
-    # Log decoded claims for diagnostics (no raw token in logs)
+    # Log decoded claims for diagnostics (no raw token in logs).
     try:
         parts   = mcp_token.split(".")
         padded  = parts[1] + "=" * (-len(parts[1]) % 4)
@@ -154,7 +164,7 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
         exp_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(claims.get('exp', 0)))
         logging.warning(
             f"exchange_for_mcp: ok  sub={claims.get('sub')}  "
-            f"aud={claims.get('aud')}  exp={exp_str}"
+            f"act={claims.get('act')}  aud={claims.get('aud')}  exp={exp_str}"
         )
     except Exception:
         logging.warning("exchange_for_mcp: ok (could not decode claims)")
