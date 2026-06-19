@@ -406,6 +406,28 @@ is being added to the cluster:
 
 Never skip Step 1. An entity that exists in SpiceDB but not in Registry-PIP
 cannot be resolved by name or surfaced to P1AZ for policy decisions.
+
+DELETION WORKFLOW — follow this order whenever removing or re-registering an entity:
+
+  STEP 1 — Read existing SpiceDB relationships FIRST:
+    read_relationships(resource_type="<type>", resource_id="<id>")
+    Note every tuple returned — you will delete them all.
+
+  STEP 2 — Delete all SpiceDB relationships for this entity:
+    update_relationships([
+      { ...each tuple from Step 1..., "operation": "OPERATION_DELETE" }
+    ])
+    Also delete any relationships where this entity appears as the SUBJECT,
+    not just as the resource.
+
+  STEP 3 — Delete the Registry-PIP entity:
+    delete_entity(id="<id>")
+
+  STEP 4 — If re-registering: follow the ONBOARDING WORKFLOW above.
+
+Never delete the Registry-PIP record without first removing its SpiceDB
+relationships. Orphaned SpiceDB tuples referencing a deleted entity will cause
+stale policy decisions and cannot be cleaned up by name later.
 """,
     before_agent_callback=inject_mcp_auth,
     tools=[
