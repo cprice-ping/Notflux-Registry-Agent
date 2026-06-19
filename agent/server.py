@@ -28,6 +28,8 @@ RUNNING LOCALLY:
   uvicorn server:app --reload --port 8080
 """
 
+import os
+
 from fastapi import FastAPI
 from google.adk.apps import App, ResumabilityConfig
 
@@ -68,3 +70,34 @@ add_adk_fastapi_endpoint(
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/mcp-servers")
+async def mcp_servers() -> list[dict]:
+    """Return the MCP servers this agent is currently configured to connect to.
+
+    Used by the frontend dashboard to show live toolset connections.
+    URLs are exposed; bearer tokens and secrets are never returned.
+    """
+    servers = [
+        {
+            "name": "SpiceDB MCP Bridge",
+            "url": os.getenv("MCP_BRIDGE_URL", "https://notflux-gateway.ping-devops.com/mcp/agent-registry"),
+            "auth": "per-turn token exchange (PingOne)",
+            "tools": ["read_schema", "write_schema", "read_relationships",
+                      "update_relationships", "check_permission"],
+        },
+        {
+            "name": "Weather",
+            "url": os.getenv("WEATHER_MCP_URL", "https://notflux-gateway.ping-devops.com/mcp/weather"),
+            "auth": "per-turn token exchange (PingOne)",
+            "tools": [],
+        },
+        {
+            "name": "Registry PIP",
+            "url": os.getenv("REGISTRY_PIP_URL", "https://notflux-registry-pip.ping-devops.com/mcp"),
+            "auth": "static bearer token",
+            "tools": ["register_entity", "resolve_entity", "list_entities", "find_entity_by_name"],
+        },
+    ]
+    return servers

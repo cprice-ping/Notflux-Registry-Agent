@@ -81,32 +81,11 @@ interface Metrics {
   pendingGrants: number | null;
 }
 
-interface McpEntity {
-  id: string;
-  type: string;
+interface McpServer {
   name: string;
-  owner_guid: string;
-  metadata: Record<string, unknown>;
-}
-
-function parseMcpEntities(result: unknown): McpEntity[] {
-  let raw: unknown = result;
-  if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { /* ignore */ } }
-  if (typeof raw === "object" && raw !== null) {
-    const o = raw as Record<string, unknown>;
-    const sc = o.structuredContent as Record<string, unknown> | undefined;
-    if (Array.isArray(sc?.result)) raw = sc!.result;
-    else if (Array.isArray(o.content)) {
-      const text = (o.content as Record<string, unknown>[])[0]?.text;
-      if (typeof text === "string") { try { raw = JSON.parse(text); } catch { /* ignore */ } }
-    }
-  }
-  if (!Array.isArray(raw)) return [];
-  return (raw as unknown[]).filter(
-    (e): e is McpEntity =>
-      typeof e === "object" && e !== null &&
-      typeof (e as Record<string,unknown>).id === "string"
-  ) as McpEntity[];
+  url: string;
+  auth: string;
+  tools: string[];
 }
 
 interface RelationshipRow {
@@ -260,46 +239,15 @@ function RegistryDashboard() {
     activeAgents: null, mcpServers: null, pendingGrants: null,
   });
   const [registryRecords, setRegistryRecords] = useState<RelationshipRow[]>([]);
-  const [mcpInventory, setMcpInventory] = useState<McpEntity[]>([]);
 
   const clearDashboard = () => {
     setRegistryRecords([]);
-    setMcpInventory([]);
     setMetrics({ activeAgents: null, mcpServers: null, pendingGrants: null });
   };
 
   useCopilotReadable({
     description: "Current counts of registered infrastructure assets shown on the dashboard.",
     value: metrics,
-  });
-
-  useRenderTool({
-    name: "list_entities",
-    parameters: z.object({ type: z.string().optional() }),
-    render: ({ status, result }) => {
-      if (status !== "complete") return (
-        <div className="animate-pulse rounded-lg border border-gray-700 bg-gray-800 p-3 text-sm text-gray-400">
-          Loading entities…
-        </div>
-      );
-      const entities = parseMcpEntities(result);
-      const mcpRelated = entities.filter(
-        (e) => e.type === "mcp_server" || e.type === "mcp_tool"
-      );
-      if (mcpRelated.length > 0) setMcpInventory((prev) => {
-        const ids = new Set(prev.map((e) => e.id));
-        const fresh = mcpRelated.filter((e) => !ids.has(e.id));
-        return fresh.length > 0 ? [...prev, ...fresh] : prev;
-      });
-      return (
-        <div className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-xs flex items-center gap-2">
-          <span className="text-emerald-400 font-semibold">
-            ✓ {entities.length} entit{entities.length !== 1 ? "ies" : "y"} loaded
-          </span>
-          <span className="text-gray-600">— inventory updated</span>
-        </div>
-      );
-    },
   });
 
   useRenderTool({
@@ -464,11 +412,10 @@ function RegistryDashboard() {
               <QuickAction prompt="List all MCP servers and their authorized agents" onClear={clearDashboard} />
               <QuickAction prompt="Can agent registry-agent access mcp_server agent-registry?" onClear={clearDashboard} />
               <QuickAction prompt="How many agents are registered?" onClear={clearDashboard} />
-              <QuickAction prompt="Show all MCP servers and tools in the registry" onClear={clearDashboard} />
             </div>
           </section>
 
-          <McpInventoryPanel inventory={mcpInventory} />
+          <McpInventoryPanel />
 
           <section className="mt-6">
             <div className="flex items-center justify-between mb-3">
@@ -541,70 +488,62 @@ function RelationshipsView({
 }
 
 // ---------------------------------------------------------------------------
-// MCP Inventory panel — fed by list_entities tool results
+// MCP Inventory panel — fetches live toolset config from /api/mcp-servers
 // ---------------------------------------------------------------------------
 
-function McpInventoryPanel({ inventory }: { inventory: McpEntity[] }) {
-  const servers = inventory.filter((e) => e.type === "mcp_server");
-  const tools   = inventory.filter((e) => e.type === "mcp_tool");
+function McpInventoryPanel() {
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  if (inventory.length === 0) return null;
+  useEffect(() => {
+    fetch("/api/mcp-servers")
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((data: McpServer[]) => setServers(data))
+      .catch(() => { /* silently hide panel on error */ })
+      .finally(() => setLoading(false));
+  }, []);
+
+  if (loading) return (
+    <section className="mt-6">
+      <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-3">
+        Connected MCP Servers
+      </h2>
+      <div className="animate-pulse h-28 rounded-xl border border-gray-800 bg-gray-900" />
+    </section>
+  );
+
+  if (servers.length === 0) return null;
 
   return (
     <section className="mt-6">
       <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-3">
-        MCP Servers &amp; Tools
+        Connected MCP Servers
       </h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {/* Servers */}
-        <div className="rounded-xl border border-gray-800 bg-gray-900 overflow-hidden">
-          <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-800/60 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-400 uppercase tracking-widest">MCP Servers</span>
-            <span className="text-xs text-gray-600">{servers.length}</span>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {servers.map((s) => (
+          <div key={s.url} className="rounded-xl border border-gray-800 bg-gray-900 overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-800 bg-gray-800/60">
+              <p className="text-sm font-semibold text-indigo-300">{s.name}</p>
+              <p className="mt-0.5 font-mono text-xs text-gray-500 truncate">{s.url}</p>
+            </div>
+            <div className="px-4 py-3 space-y-2">
+              <p className="text-xs text-gray-500">
+                <span className="text-gray-600 uppercase tracking-widest mr-1">Auth</span>
+                {s.auth}
+              </p>
+              {s.tools.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {s.tools.map((t) => (
+                    <span key={t}
+                      className="rounded-md bg-gray-800 border border-gray-700 px-2 py-0.5 font-mono text-xs text-emerald-400">
+                      {t}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-          {servers.length === 0 ? (
-            <p className="px-4 py-3 text-xs text-gray-600">None registered.</p>
-          ) : (
-            <ul className="divide-y divide-gray-800/50">
-              {servers.map((s) => (
-                <li key={s.id} className="px-4 py-3 hover:bg-gray-800/30 transition-colors">
-                  <p className="text-sm font-medium text-indigo-300">{s.name}</p>
-                  <p className="mt-0.5 font-mono text-xs text-gray-500 truncate">{s.id}</p>
-                  {Object.keys(s.metadata ?? {}).length > 0 && (
-                    <p className="mt-1 text-xs text-gray-600 truncate">
-                      {Object.entries(s.metadata).map(([k, v]) => `${k}: ${v}`).join(" · ")}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-
-        {/* Tools */}
-        <div className="rounded-xl border border-gray-800 bg-gray-900 overflow-hidden">
-          <div className="px-4 py-2.5 border-b border-gray-800 bg-gray-800/60 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-400 uppercase tracking-widest">MCP Tools</span>
-            <span className="text-xs text-gray-600">{tools.length}</span>
-          </div>
-          {tools.length === 0 ? (
-            <p className="px-4 py-3 text-xs text-gray-600">None registered.</p>
-          ) : (
-            <ul className="divide-y divide-gray-800/50">
-              {tools.map((t) => (
-                <li key={t.id} className="px-4 py-3 hover:bg-gray-800/30 transition-colors">
-                  <p className="text-sm font-medium text-emerald-300">{t.name}</p>
-                  <p className="mt-0.5 font-mono text-xs text-gray-500 truncate">{t.id}</p>
-                  {Object.keys(t.metadata ?? {}).length > 0 && (
-                    <p className="mt-1 text-xs text-gray-600 truncate">
-                      {Object.entries(t.metadata).map(([k, v]) => `${k}: ${v}`).join(" · ")}
-                    </p>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+        ))}
       </div>
     </section>
   );
