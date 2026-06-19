@@ -9,6 +9,7 @@ do not need to perform their own auth checks.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastmcp import FastMCP
@@ -25,6 +26,7 @@ mcp = FastMCP(
         "Use resolve_entity to look up a canonical entity record by its stable ID. "
         "Use list_entities to browse all registered entities (optionally filtered by type) when you do not know the ID. "
         "Use find_entity_by_name to search by human-readable name when an admin asks about an entity by name rather than ID. "
+        "Use delete_entity to permanently remove a stale record before re-registering it with updated fields. "
         "Entity IDs are the same identifiers used in SpiceDB relationship tuples."
     ),
 )
@@ -37,6 +39,7 @@ async def register_entity(
     name: str,
     owner_guid: str,
     metadata: dict[str, Any] | None = None,
+    sub: str | None = None,
 ) -> str:
     """
     Create or update an entity record in the Registry.
@@ -51,10 +54,19 @@ async def register_entity(
         name:       Human-friendly display name shown in the dashboard.
         owner_guid: GUID of the owning principal.
         metadata:   Optional key/value bag for additional attributes (stored as JSONB).
+        sub:        Optional OIDC subject claim for workload identities (e.g. a k8s
+                    Service Account sub like
+                    "system:serviceaccount:namespace:name"). When provided, a
+                    SHA-256 hash is computed and stored as sub_hash. Use the
+                    returned sub_hash value — NOT the raw sub — as the subject_id
+                    in SpiceDB relationship tuples (SpiceDB forbids colons in IDs).
 
-    Returns a confirmation string with the entity ID and whether it was
-    newly created or updated.
+    Returns a confirmation string with the entity ID and sub_hash (if applicable).
     """
+    sub_hash: str | None = None
+    if sub:
+        sub_hash = hashlib.sha256(sub.encode()).hexdigest()
+
     async with AsyncSessionLocal() as session:
         existing = await session.get(Entity, id)
         if existing:
@@ -62,6 +74,9 @@ async def register_entity(
             existing.name = name
             existing.owner_guid = owner_guid
             existing.entity_metadata = metadata or {}
+            if sub is not None:
+                existing.raw_sub = sub
+                existing.sub_hash = sub_hash
             action = "updated"
         else:
             session.add(
@@ -71,12 +86,17 @@ async def register_entity(
                     name=name,
                     owner_guid=owner_guid,
                     entity_metadata=metadata or {},
+                    raw_sub=sub,
+                    sub_hash=sub_hash,
                 )
             )
             action = "registered"
         await session.commit()
 
-    return f"Entity '{id}' {action} successfully."
+    result = f"Entity '{id}' {action} successfully."
+    if sub_hash:
+        result += f" sub_hash={sub_hash} — use this value as subject_id in SpiceDB relationships."
+    return result
 
 
 @mcp.tool()
@@ -101,6 +121,7 @@ async def resolve_entity(id: str) -> dict[str, Any]:
             "name": entity.name,
             "owner_guid": entity.owner_guid,
             "metadata": entity.entity_metadata or {},
+            "sub_hash": entity.sub_hash,
         }
 
 
@@ -130,6 +151,7 @@ async def list_entities(type: str | None = None) -> list[dict[str, Any]]:
             "name": e.name,
             "owner_guid": e.owner_guid,
             "metadata": e.entity_metadata or {},
+            "sub_hash": e.sub_hash,
         }
         for e in rows
     ]
@@ -166,6 +188,29 @@ async def find_entity_by_name(name: str, type: str | None = None) -> list[dict[s
             "name": e.name,
             "owner_guid": e.owner_guid,
             "metadata": e.entity_metadata or {},
+            "sub_hash": e.sub_hash,
         }
         for e in rows
     ]
+
+
+@mcp.tool()
+async def delete_entity(id: str) -> str:
+    """
+    Permanently remove an entity record from the Registry.
+
+    Use this to clean up stale entries before re-registering with updated
+    fields (e.g. to add a sub / sub_hash to an existing entity).
+
+    Args:
+        id: The canonical entity identifier to delete.
+
+    Returns a confirmation string, or an error if the entity does not exist.
+    """
+    async with AsyncSessionLocal() as session:
+        entity = await session.get(Entity, id)
+        if entity is None:
+            raise ValueError(f"Entity '{id}' not found in the Registry.")
+        await session.delete(entity)
+        await session.commit()
+    return f"Entity '{id}' deleted successfully."

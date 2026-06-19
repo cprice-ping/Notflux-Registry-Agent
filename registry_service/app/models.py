@@ -43,9 +43,18 @@ class Entity(Base):
     entity_metadata: Mapped[dict[str, Any] | None] = mapped_column(
         "metadata", JSONB, nullable=True, default=dict
     )
+    # Workload identity fields — populated when the entity represents a
+    # k8s Service Account or any principal whose OIDC sub contains characters
+    # illegal in SpiceDB object IDs (colons, slashes, etc.).
+    #
+    # raw_sub  — the original OIDC sub claim (e.g.
+    #            "system:serviceaccount:ping-devops-cprice:notflux-registry-agent")
+    # sub_hash — SHA-256 hex of raw_sub, used as the SpiceDB object ID in
+    #            relationship tuples. Always 64 hex chars; unique per sub.
+    raw_sub: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
+    sub_hash: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
 
     __table_args__ = (
-        # id is already indexed as PK; declare explicitly for intent + secondary
-        # lookups by type (e.g. "list all agents").
         Index("ix_entities_type", "type"),
+        Index("ix_entities_sub_hash", "sub_hash", unique=True),
     )

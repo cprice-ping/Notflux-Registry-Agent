@@ -342,14 +342,24 @@ The Registry-PIP is the name-to-ID source of truth for all entities in the
 Notflux cluster. Every agent, user, or MCP server that needs a human-readable
 name recorded, or whose ID you want to look up later, must be registered here.
 
-• register_entity(id, type, name, owner_guid, metadata) — upsert an entity.
+• register_entity(id, type, name, owner_guid, metadata, sub) — upsert an entity.
   - id:         Stable unique identifier (Vertex resource path, PingOne GUID,
                 or any opaque string). This SAME id must be used in SpiceDB
-                relationships.
+                relationships — UNLESS the entity has a sub_hash (see below).
   - type:       One of: "agent", "user", "mcp_server", "mcp_tool"
   - name:       Human-readable display name.
   - owner_guid: PingOne user GUID of the human who owns this entity.
   - metadata:   Optional JSON dict for extra context.
+  - sub:        OPTIONAL. The raw OIDC `sub` claim for workload identities,
+                e.g. "system:serviceaccount:namespace:name" for k8s Service
+                Accounts. When provided, the tool computes a SHA-256 hash of
+                the sub and stores it as `sub_hash`.
+
+  ⚠️  WORKLOAD IDENTITY RULE — When `sub` is provided, the response includes
+  `sub_hash=<64-hex-chars>`. You MUST use that sub_hash value — NOT the raw
+  sub, NOT the entity id — as the subject_id in all SpiceDB relationship tuples
+  for this entity. SpiceDB forbids colons in object IDs; the hash is the only
+  safe identifier. Record the sub_hash in a note before calling update_relationships.
 
 • resolve_entity(id) — look up a previously registered entity by id.
   Use this before calling update_relationships when you need to confirm an
@@ -375,15 +385,23 @@ is being added to the cluster:
       type="agent",          # or mcp_server / user / mcp_tool
       name="<display-name>",
       owner_guid="<owner-pingone-guid>",
+      sub="<oidc-sub-claim>",  # include if this is a k8s SA or workload identity
     )
+    → If sub was provided, note the sub_hash from the response. You will use
+      it in Step 2 instead of the id.
 
-  STEP 2 — Grant permissions in SpiceDB (use the SAME id):
+  STEP 2 — Grant permissions in SpiceDB:
+    For standard entities (no sub):
+      subject_id = "<stable-resource-id>"   # same as Step 1 id
+    For workload identities (sub was provided):
+      subject_id = "<sub_hash from Step 1 response>"  # the 64-hex-char hash
+
     update_relationships(relationships=[
       { "resource_type": "agent",
-        "resource_id":   "<stable-resource-id>",   # ← must match Step 1
+        "resource_id":   "<stable-resource-id>",
         "relation":      "owner",
         "subject_type":  "user",
-        "subject_id":    "<owner-subject-id>" }
+        "subject_id":    "<subject_id as determined above>" }
     ], operation="OPERATION_TOUCH")
 
 Never skip Step 1. An entity that exists in SpiceDB but not in Registry-PIP
