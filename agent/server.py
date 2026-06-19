@@ -76,20 +76,49 @@ async def healthz() -> dict:
 
 
 async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
-    """POST tools/list directly — FastMCP streamable-HTTP is stateless per request."""
+    """Probe an MCP server for its tool list.
+
+    FastMCP streamable-HTTP requires an initialize handshake first — the server
+    returns a Mcp-Session-Id header which must be included on the tools/list call.
+    Both calls are made within a single httpx session (same TCP connection).
+    """
     import json as _json
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.post(
+            base_headers = {
+                **headers,
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            # Step 1: initialize — capture Mcp-Session-Id
+            init_resp = await client.post(
                 url,
-                headers={**headers, "Content-Type": "application/json",
-                         "Accept": "application/json, text/event-stream"},
-                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                headers=base_headers,
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-03-26",
+                                 "clientInfo": {"name": "status-probe", "version": "0"},
+                                 "capabilities": {}}},
             )
-            if resp.status_code != 200:
-                logging.warning(f"_probe_mcp_tools: {url} status={resp.status_code}")
+            logging.info(f"_probe_mcp_tools: {url} initialize status={init_resp.status_code}")
+            if init_resp.status_code != 200:
                 return []
-            for line in resp.text.splitlines():
+
+            session_id = init_resp.headers.get("mcp-session-id") or init_resp.headers.get("Mcp-Session-Id")
+            call_headers = {**base_headers}
+            if session_id:
+                call_headers["Mcp-Session-Id"] = session_id
+
+            # Step 2: tools/list with session ID
+            tools_resp = await client.post(
+                url,
+                headers=call_headers,
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            logging.info(f"_probe_mcp_tools: {url} tools/list status={tools_resp.status_code}")
+            if tools_resp.status_code != 200:
+                return []
+
+            for line in tools_resp.text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
                     line = line[5:].strip()
@@ -100,7 +129,7 @@ async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
                     tools = obj.get("result", {}).get("tools", [])
                     if tools is not None:
                         names = [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
-                        logging.info(f"_probe_mcp_tools: {url} found {names}")
+                        logging.info(f"_probe_mcp_tools: {url} tools={names}")
                         return names
                 except Exception:
                     continue
