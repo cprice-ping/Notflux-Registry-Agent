@@ -28,8 +28,10 @@ RUNNING LOCALLY:
   uvicorn server:app --reload --port 8080
 """
 
+import asyncio
 import os
 
+import httpx
 from fastapi import FastAPI
 from google.adk.apps import App, ResumabilityConfig
 
@@ -72,32 +74,93 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
+async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
+    """Send an MCP tools/list request and return the tool names."""
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            # Step 1: initialize
+            init_resp = await client.post(
+                url,
+                headers={**headers, "Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2025-03-26",
+                                 "clientInfo": {"name": "status-probe", "version": "0"},
+                                 "capabilities": {}}},
+            )
+            if init_resp.status_code != 200:
+                return []
+            # Step 2: tools/list
+            tools_resp = await client.post(
+                url,
+                headers={**headers, "Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"},
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+            if tools_resp.status_code != 200:
+                return []
+            # Parse SSE or plain JSON
+            text = tools_resp.text
+            import json as _json
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                try:
+                    obj = _json.loads(line)
+                    tools = obj.get("result", {}).get("tools", [])
+                    return [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return []
+
+
 @app.get("/mcp-servers")
 async def mcp_servers() -> list[dict]:
-    """Return the MCP servers this agent is currently configured to connect to.
+    """Return live status of each MCP server the agent is configured to connect to.
 
-    Used by the frontend dashboard to show live toolset connections.
-    URLs are exposed; bearer tokens and secrets are never returned.
+    Probes each server's tools/list endpoint so the dashboard reflects real
+    connectivity, not hardcoded assumptions.
     """
-    servers = [
+    from agent import BRIDGE_URL, WEATHER_URL, REGISTRY_PIP_URL, _REGISTRY_PIP_API_KEY
+
+    pip_key = _REGISTRY_PIP_API_KEY
+    gateway_token_placeholder = "probe-no-user-token"  # tools/list doesn't need real auth on most servers
+
+    servers_config = [
         {
             "name": "SpiceDB MCP Bridge",
-            "url": os.getenv("MCP_BRIDGE_URL", "https://notflux-gateway.ping-devops.com/mcp/agent-registry"),
+            "url": BRIDGE_URL,
             "auth": "per-turn token exchange (PingOne)",
-            "tools": ["read_schema", "write_schema", "read_relationships",
-                      "update_relationships", "check_permission"],
+            "headers": {"Authorization": f"Bearer {gateway_token_placeholder}"},
         },
         {
             "name": "Weather",
-            "url": os.getenv("WEATHER_MCP_URL", "https://notflux-gateway.ping-devops.com/mcp/weather"),
+            "url": WEATHER_URL,
             "auth": "per-turn token exchange (PingOne)",
-            "tools": [],
+            "headers": {"Authorization": f"Bearer {gateway_token_placeholder}"},
         },
         {
             "name": "Registry PIP",
-            "url": os.getenv("REGISTRY_PIP_URL", "https://notflux-registry-pip.ping-devops.com/mcp"),
+            "url": REGISTRY_PIP_URL,
             "auth": "static bearer token",
-            "tools": ["register_entity", "resolve_entity", "list_entities", "find_entity_by_name"],
+            "headers": {"Authorization": f"Bearer {pip_key}"} if pip_key else {},
         },
     ]
-    return servers
+
+    results = await asyncio.gather(*[
+        _probe_mcp_tools(s["url"], s["headers"]) for s in servers_config
+    ])
+
+    return [
+        {
+            "name": s["name"],
+            "url": s["url"],
+            "auth": s["auth"],
+            "tools": tools,
+            "reachable": len(tools) > 0,
+        }
+        for s, tools in zip(servers_config, results)
+    ]

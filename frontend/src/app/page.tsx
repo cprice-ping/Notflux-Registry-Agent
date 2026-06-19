@@ -86,6 +86,7 @@ interface McpServer {
   url: string;
   auth: string;
   tools: string[];
+  reachable?: boolean;
 }
 
 interface RelationshipRow {
@@ -523,7 +524,13 @@ function McpInventoryPanel() {
         {servers.map((s) => (
           <div key={s.url} className="rounded-xl border border-gray-800 bg-gray-900 overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-800 bg-gray-800/60">
-              <p className="text-sm font-semibold text-indigo-300">{s.name}</p>
+              <div className="flex items-center gap-2">
+                <span className={`h-2 w-2 rounded-full flex-shrink-0 ${
+                  s.reachable === undefined ? "bg-gray-600" :
+                  s.reachable ? "bg-emerald-400" : "bg-red-500"
+                }`} />
+                <p className="text-sm font-semibold text-indigo-300">{s.name}</p>
+              </div>
               <p className="mt-0.5 font-mono text-xs text-gray-500 truncate">{s.url}</p>
             </div>
             <div className="px-4 py-3 space-y-2">
