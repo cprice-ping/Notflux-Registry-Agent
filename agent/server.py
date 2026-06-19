@@ -76,63 +76,72 @@ async def healthz() -> dict:
 
 
 async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
-    """Probe an MCP server for its tool list.
+    """Probe an MCP server for its tool list using streaming reads.
 
-    FastMCP streamable-HTTP requires an initialize handshake first — the server
-    returns a Mcp-Session-Id header which must be included on the tools/list call.
-    Both calls are made within a single httpx session (same TCP connection).
+    FastMCP returns text/event-stream and keeps the connection open.
+    We read line-by-line and return as soon as we parse the tools/list result,
+    rather than waiting for the stream to close (which it never does).
     """
     import json as _json
+
+    base_headers = {
+        **headers,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            base_headers = {
-                **headers,
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            }
-            # Step 1: initialize — capture Mcp-Session-Id
-            init_resp = await client.post(
-                url,
-                headers=base_headers,
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, read=8.0)) as client:
+            # Step 1: initialize — get Mcp-Session-Id, read first event then move on.
+            session_id: str | None = None
+            async with client.stream(
+                "POST", url, headers=base_headers,
                 json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": "2025-03-26",
+                      "params": {"protocolVersion": "2025-06-18",
                                  "clientInfo": {"name": "status-probe", "version": "0"},
                                  "capabilities": {}}},
-            )
-            logging.info(f"_probe_mcp_tools: {url} initialize status={init_resp.status_code}")
-            if init_resp.status_code != 200:
-                return []
+            ) as init_resp:
+                if init_resp.status_code != 200:
+                    logging.warning(f"_probe_mcp_tools: {url} initialize status={init_resp.status_code}")
+                    return []
+                session_id = (
+                    init_resp.headers.get("mcp-session-id") or
+                    init_resp.headers.get("Mcp-Session-Id")
+                )
+                # Read until we get the first data line, then stop.
+                async for line in init_resp.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        break  # got the initialize response, session is established
 
-            session_id = init_resp.headers.get("mcp-session-id") or init_resp.headers.get("Mcp-Session-Id")
             call_headers = {**base_headers}
             if session_id:
                 call_headers["Mcp-Session-Id"] = session_id
 
-            # Step 2: tools/list with session ID
-            tools_resp = await client.post(
-                url,
-                headers=call_headers,
+            # Step 2: tools/list — stream lines and return on first result.
+            async with client.stream(
+                "POST", url, headers=call_headers,
                 json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            )
-            logging.info(f"_probe_mcp_tools: {url} tools/list status={tools_resp.status_code}")
-            if tools_resp.status_code != 200:
-                return []
-
-            for line in tools_resp.text.splitlines():
-                line = line.strip()
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if not line:
-                    continue
-                try:
-                    obj = _json.loads(line)
-                    tools = obj.get("result", {}).get("tools", [])
-                    if tools is not None:
-                        names = [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
-                        logging.info(f"_probe_mcp_tools: {url} tools={names}")
-                        return names
-                except Exception:
-                    continue
+            ) as tools_resp:
+                if tools_resp.status_code != 200:
+                    logging.warning(f"_probe_mcp_tools: {url} tools/list status={tools_resp.status_code}")
+                    return []
+                async for line in tools_resp.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = _json.loads(line)
+                        tools = obj.get("result", {}).get("tools", [])
+                        if tools is not None:
+                            names = [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
+                            logging.info(f"_probe_mcp_tools: {url} tools={names}")
+                            return names
+                    except Exception:
+                        continue
     except Exception as exc:
         logging.warning(f"_probe_mcp_tools: {url} exception={exc}")
     return []
@@ -141,11 +150,12 @@ async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
 async def _check_reachable(url: str) -> bool:
     """Any HTTP response (even 401/403) means the server is up."""
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=5.0)) as client:
             resp = await client.post(
                 url,
                 headers={"Content-Type": "application/json",
-                         "Accept": "application/json, text/event-stream"},
+                         "Accept": "application/json, text/event-stream",
+                         "MCP-Protocol-Version": "2025-06-18"},
                 json={"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {}},
             )
             logging.info(f"_check_reachable: {url} status={resp.status_code}")
