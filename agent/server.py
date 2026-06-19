@@ -29,10 +29,11 @@ RUNNING LOCALLY:
 """
 
 import asyncio
+import logging
 import os
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from google.adk.apps import App, ResumabilityConfig
 
 from ag_ui_adk import ADKAgent, add_adk_fastapi_endpoint
@@ -75,10 +76,11 @@ async def healthz() -> dict:
 
 
 async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
-    """Send an MCP tools/list request and return the tool names."""
+    """Send an MCP tools/list request and return the tool names.
+    Only usable when we have a valid bearer token (e.g. Registry PIP static key).
+    """
     try:
         async with httpx.AsyncClient(timeout=6) as client:
-            # Step 1: initialize
             init_resp = await client.post(
                 url,
                 headers={**headers, "Content-Type": "application/json",
@@ -90,7 +92,6 @@ async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
             )
             if init_resp.status_code != 200:
                 return []
-            # Step 2: tools/list
             tools_resp = await client.post(
                 url,
                 headers={**headers, "Content-Type": "application/json",
@@ -99,10 +100,8 @@ async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
             )
             if tools_resp.status_code != 200:
                 return []
-            # Parse SSE or plain JSON
-            text = tools_resp.text
             import json as _json
-            for line in text.splitlines():
+            for line in tools_resp.text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
                     line = line[5:].strip()
@@ -117,50 +116,116 @@ async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
     return []
 
 
+async def _check_reachable(url: str) -> bool:
+    """Return True if the endpoint responds to any HTTP request (even 401/403).
+    A real HTTP response means the server is up; a connection error means it's down.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(
+                url,
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"},
+                json={"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                      "params": {"protocolVersion": "2025-03-26",
+                                 "clientInfo": {"name": "reachability-probe", "version": "0"},
+                                 "capabilities": {}}},
+            )
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
 @app.get("/mcp-servers")
-async def mcp_servers() -> list[dict]:
+async def mcp_servers(
+    x_agent_authorization: str | None = Header(default=None),
+) -> list[dict]:
     """Return live status of each MCP server the agent is configured to connect to.
 
-    Probes each server's tools/list endpoint so the dashboard reflects real
-    connectivity, not hardcoded assumptions.
+    When the caller provides x-agent-authorization (the user's agent_token from
+    PingOne Exchange 1), this endpoint performs Exchange 2 to obtain a real gateway
+    token and probes each gateway-protected server with it.  The reachable/tools
+    result therefore reflects actual policy — if the gateway denies the agent,
+    the server shows as unreachable.
+
+    Registry PIP uses its static bearer key and is always fully live-probed.
     """
-    from agent import BRIDGE_URL, WEATHER_URL, REGISTRY_PIP_URL, _REGISTRY_PIP_API_KEY
+    from agent import (
+        BRIDGE_URL, WEATHER_URL, REGISTRY_PIP_URL, _REGISTRY_PIP_API_KEY,
+        _exchange_for_mcp_token,
+    )
 
-    pip_key = _REGISTRY_PIP_API_KEY
-    gateway_token_placeholder = "probe-no-user-token"  # tools/list doesn't need real auth on most servers
+    pip_headers = {"Authorization": f"Bearer {_REGISTRY_PIP_API_KEY}"} if _REGISTRY_PIP_API_KEY else {}
 
-    servers_config = [
-        {
-            "name": "SpiceDB MCP Bridge",
-            "url": BRIDGE_URL,
-            "auth": "per-turn token exchange (PingOne)",
-            "headers": {"Authorization": f"Bearer {gateway_token_placeholder}"},
-        },
-        {
-            "name": "Weather",
-            "url": WEATHER_URL,
-            "auth": "per-turn token exchange (PingOne)",
-            "headers": {"Authorization": f"Bearer {gateway_token_placeholder}"},
-        },
-        {
-            "name": "Registry PIP",
-            "url": REGISTRY_PIP_URL,
-            "auth": "static bearer token",
-            "headers": {"Authorization": f"Bearer {pip_key}"} if pip_key else {},
-        },
-    ]
+    # Attempt Exchange 2 if we have an agent token.
+    gateway_headers: dict = {}
+    if x_agent_authorization:
+        agent_token = x_agent_authorization.removeprefix("Bearer ").strip()
+        try:
+            mcp_token = _exchange_for_mcp_token(agent_token)
+            gateway_headers = {"Authorization": f"Bearer {mcp_token}"}
+            logging.info("mcp-servers probe: exchange ok, probing with real gateway token")
+        except Exception as exc:
+            logging.warning(f"mcp-servers probe: exchange failed — {exc}; falling back to reachability-only")
 
-    results = await asyncio.gather(*[
-        _probe_mcp_tools(s["url"], s["headers"]) for s in servers_config
-    ])
-
-    return [
-        {
-            "name": s["name"],
-            "url": s["url"],
-            "auth": s["auth"],
-            "tools": tools,
-            "reachable": len(tools) > 0,
-        }
-        for s, tools in zip(servers_config, results)
-    ]
+    if gateway_headers:
+        # Full tools/list probe with real token.
+        bridge_tools, weather_tools, pip_tools = await asyncio.gather(
+            _probe_mcp_tools(BRIDGE_URL, gateway_headers),
+            _probe_mcp_tools(WEATHER_URL, gateway_headers),
+            _probe_mcp_tools(REGISTRY_PIP_URL, pip_headers),
+        )
+        return [
+            {
+                "name": "SpiceDB MCP Bridge",
+                "url": BRIDGE_URL,
+                "auth": "per-turn token exchange (PingOne)",
+                "tools": bridge_tools,
+                "reachable": len(bridge_tools) > 0,
+            },
+            {
+                "name": "Weather",
+                "url": WEATHER_URL,
+                "auth": "per-turn token exchange (PingOne)",
+                "tools": weather_tools,
+                "reachable": len(weather_tools) > 0,
+            },
+            {
+                "name": "Registry PIP",
+                "url": REGISTRY_PIP_URL,
+                "auth": "static bearer token",
+                "tools": pip_tools,
+                "reachable": len(pip_tools) > 0,
+            },
+        ]
+    else:
+        # No agent token — fall back to unauthenticated reachability check + static tool lists.
+        bridge_reachable, weather_reachable, pip_tools = await asyncio.gather(
+            _check_reachable(BRIDGE_URL),
+            _check_reachable(WEATHER_URL),
+            _probe_mcp_tools(REGISTRY_PIP_URL, pip_headers),
+        )
+        return [
+            {
+                "name": "SpiceDB MCP Bridge",
+                "url": BRIDGE_URL,
+                "auth": "per-turn token exchange (PingOne)",
+                "tools": ["read_schema", "write_schema", "read_relationships",
+                          "update_relationships", "check_permission"],
+                "reachable": bridge_reachable,
+            },
+            {
+                "name": "Weather",
+                "url": WEATHER_URL,
+                "auth": "per-turn token exchange (PingOne)",
+                "tools": [],
+                "reachable": weather_reachable,
+            },
+            {
+                "name": "Registry PIP",
+                "url": REGISTRY_PIP_URL,
+                "auth": "static bearer token",
+                "tools": pip_tools,
+                "reachable": len(pip_tools) > 0,
+            },
+        ]
