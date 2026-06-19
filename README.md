@@ -397,7 +397,15 @@ STEP 2 — Grant permissions in SpiceDB (use the SAME id as subject_id):
 
 ### Workload identities (k8s Service Account, Vertex Agent)
 
-OIDC `sub` claims from workload identities contain characters illegal in SpiceDB object IDs (`:`  for k8s, `/` for Vertex). Use the `sub_hash` pattern:
+OIDC `sub` claims from workload identities contain characters illegal in SpiceDB object IDs — k8s uses colons (`system:serviceaccount:namespace:name`) and Vertex AI uses slashes (`projects/x/locations/y/agents/z`). SpiceDB only permits alphanumerics, hyphens, underscores, and dots.
+
+Rather than slugging or truncating the sub (which risks collisions and loses the full identity), we SHA-256 hash it. The hash is:
+- **Character-safe** — 64 hex chars, always valid as a SpiceDB object ID
+- **Collision-resistant** — any two distinct subs produce distinct hashes with overwhelming probability
+- **Consistent** — `hashlib.sha256(sub.encode()).hexdigest()` in Python, `${#crypto.sha256Hex(actor.sub)}` in PEL, same output
+- **Auditable** — the raw sub is stored in Registry PIP's `raw_sub` column and preserved as `act.sub` in the token; the hash is `act.sub_hash`
+
+P1AZ reads `act.sub_hash` from the mcp_token for SpiceDB permission checks. The raw sub is never used as a SpiceDB identifier.
 
 ```
 STEP 1 — Register with the raw sub:
