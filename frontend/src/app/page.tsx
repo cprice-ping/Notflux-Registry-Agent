@@ -531,7 +531,7 @@ function McpInventoryPanel() {
                 }`} />
                 <p className="text-sm font-semibold text-indigo-300">{s.name}</p>
               </div>
-              <p className="mt-0.5 font-mono text-xs text-gray-500 truncate">{s.url}</p>
+              <p className="mt-0.5 font-mono text-xs text-gray-500 break-all">{s.url}</p>
             </div>
             <div className="px-4 py-3 space-y-2">
               <p className="text-xs text-gray-500">

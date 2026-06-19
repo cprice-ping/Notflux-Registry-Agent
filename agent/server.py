@@ -76,63 +76,53 @@ async def healthz() -> dict:
 
 
 async def _probe_mcp_tools(url: str, headers: dict) -> list[str]:
-    """Send an MCP tools/list request and return the tool names.
-    Only usable when we have a valid bearer token (e.g. Registry PIP static key).
-    """
+    """POST tools/list directly — FastMCP streamable-HTTP is stateless per request."""
+    import json as _json
     try:
-        async with httpx.AsyncClient(timeout=6) as client:
-            init_resp = await client.post(
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.post(
                 url,
                 headers={**headers, "Content-Type": "application/json",
                          "Accept": "application/json, text/event-stream"},
-                json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                      "params": {"protocolVersion": "2025-03-26",
-                                 "clientInfo": {"name": "status-probe", "version": "0"},
-                                 "capabilities": {}}},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
             )
-            if init_resp.status_code != 200:
+            if resp.status_code != 200:
+                logging.warning(f"_probe_mcp_tools: {url} status={resp.status_code}")
                 return []
-            tools_resp = await client.post(
-                url,
-                headers={**headers, "Content-Type": "application/json",
-                         "Accept": "application/json, text/event-stream"},
-                json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            )
-            if tools_resp.status_code != 200:
-                return []
-            import json as _json
-            for line in tools_resp.text.splitlines():
+            for line in resp.text.splitlines():
                 line = line.strip()
                 if line.startswith("data:"):
                     line = line[5:].strip()
+                if not line:
+                    continue
                 try:
                     obj = _json.loads(line)
                     tools = obj.get("result", {}).get("tools", [])
-                    return [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
+                    if tools is not None:
+                        names = [t["name"] for t in tools if isinstance(t, dict) and "name" in t]
+                        logging.info(f"_probe_mcp_tools: {url} found {names}")
+                        return names
                 except Exception:
                     continue
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning(f"_probe_mcp_tools: {url} exception={exc}")
     return []
 
 
 async def _check_reachable(url: str) -> bool:
-    """Return True if the endpoint responds to any HTTP request (even 401/403).
-    A real HTTP response means the server is up; a connection error means it's down.
-    """
+    """Any HTTP response (even 401/403) means the server is up."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(
                 url,
                 headers={"Content-Type": "application/json",
                          "Accept": "application/json, text/event-stream"},
-                json={"jsonrpc": "2.0", "id": 0, "method": "initialize",
-                      "params": {"protocolVersion": "2025-03-26",
-                                 "clientInfo": {"name": "reachability-probe", "version": "0"},
-                                 "capabilities": {}}},
+                json={"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {}},
             )
+            logging.info(f"_check_reachable: {url} status={resp.status_code}")
             return resp.status_code < 500
-    except Exception:
+    except Exception as exc:
+        logging.warning(f"_check_reachable: {url} exception={exc}")
         return False
 
 
