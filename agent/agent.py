@@ -56,6 +56,7 @@ from google.genai import types
 # Configuration
 # ---------------------------------------------------------------------------
 BRIDGE_URL = os.getenv('MCP_BRIDGE_URL', 'https://notflux-gateway.ping-devops.com/mcp/agent-registry')
+WEATHER_URL = os.getenv('WEATHER_MCP_URL', 'https://notflux-gateway.ping-devops.com/mcp/weather')
 
 # Registry-PIP MCP endpoint — static bearer token (no per-turn exchange).
 REGISTRY_PIP_URL     = os.getenv('REGISTRY_PIP_URL', 'https://notflux-registry-pip.ping-devops.com/mcp')
@@ -232,6 +233,13 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
         McpToolset(
             connection_params=StreamableHTTPConnectionParams(
                 url=BRIDGE_URL,
+                headers={"Authorization": mcp_auth},
+            )
+        ),
+        # Weather MCP server — same PingGateway, same per-turn token.
+        McpToolset(
+            connection_params=StreamableHTTPConnectionParams(
+                url=WEATHER_URL,
                 headers={"Authorization": mcp_auth},
             )
         ),

@@ -96,6 +96,12 @@ spec:
                 secretKeyRef:
                   name: registry-agent-secrets
                   key: PINGONE_MCP_SCOPE
+            # Weather MCP server — same PingGateway, same per-turn token.
+            - name: WEATHER_MCP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: WEATHER_MCP_URL
             # Registry-PIP MCP endpoint — static bearer token, no per-turn exchange.
             - name: REGISTRY_PIP_URL
               valueFrom:
