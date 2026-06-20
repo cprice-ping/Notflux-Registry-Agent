@@ -122,21 +122,27 @@ The SpiceDB schema (`schema/schema.zed`) defines four object types:
 
 ```
 agent
-  └── owner: user                      — which human owns this agent
+  ├── owner: user                      — which human owns this agent
+  └── active_driver: user              — ephemeral driver, supplied via P1AZ contextual tuples
 
 mcp_server
   ├── authorized_agent: agent          — agent has blanket access to all tools on this server
   ├── authorized_user: user            — user can view this server
-  └── public_to_all_users: user:*      — open to all authenticated users
-      └── view_server (permission) = authorized_user + public_to_all_users
+  ├── public_to_all_users: user:*      — open to all authenticated users
+  ├── view_server (permission)      = authorized_user + public_to_all_users
+  └── agent_can_connect (permission) = authorized_agent
 
 mcp_tool
   ├── parent_server: mcp_server        — which server this tool belongs to
-  └── direct_agent: agent              — agent has direct access to this specific tool
-      └── execute (permission) = direct_agent + parent_server->authorized_agent
+  ├── direct_agent: agent              — agent has direct access to this specific tool
+  └── execute (permission) = (direct_agent + parent_server->authorized_agent)
+                             & parent_server->view_server
 ```
 
-An agent can execute a tool if it has **either** a `direct_agent` relationship on the tool **or** an `authorized_agent` relationship on the tool's parent server.
+An agent can execute a tool when it has **either** a `direct_agent` relationship on the
+tool **or** an `authorized_agent` relationship on the tool's parent server — **and** the
+parent server is viewable (`view_server`). The `view_server` conjunct ensures a tool is
+never executable on a server the caller cannot see.
 
 ---
 
@@ -274,14 +280,14 @@ kubectl create secret generic registry-pip-secrets \
 
 # Registry Agent secrets
 # REGISTRY_PIP_API_KEY: copy from registry-pip-secrets MCP_API_KEY
+# NOTE: the token exchange runs through the DaVinci flow, so the legacy
+# PINGONE_ENV_ID / PINGONE_CLIENT_ID / PINGONE_CLIENT_SECRET / PINGONE_MCP_SCOPE
+# keys are no longer consumed by the agent and have been dropped.
 kubectl create secret generic registry-agent-secrets \
   --namespace ping-devops-cprice \
   --from-literal=GOOGLE_API_KEY="<gemini-api-key>" \
   --from-literal=MCP_BRIDGE_URL="https://<your-gateway-host>/mcp/agent-registry" \
   --from-literal=WEATHER_MCP_URL="https://<your-gateway-host>/mcp/weather" \
-  --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
-  --from-literal=PINGONE_CLIENT_ID="<token-exchange-client-id>" \
-  --from-literal=PINGONE_CLIENT_SECRET="<token-exchange-client-secret>" \
   --from-literal=PINGONE_AGENT_AUDIENCE="<aud-claim-for-agent-token>" \
   --from-literal=DAVINCI_POLICY_URL="https://orchestrate-api.pingone.com/v1/company/<env-id>/policy/<flow-id>/start" \
   --from-literal=DAVINCI_POLICY_API_KEY="<davinci-flow-api-key>" \

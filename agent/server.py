@@ -3,26 +3,26 @@ agent/server.py
 
 AG-UI FastAPI server wrapping the Registry Governor ADK agent.
 
-This is the Cloud Run entry point.  It exposes the ADK agent over the AG-UI
-protocol so CopilotKit on the frontend can:
+This is the in-cluster entry point (see k8s/registry-agent.yaml). It exposes the
+ADK agent over the AG-UI protocol so CopilotKit on the frontend can:
   - Stream thinking steps / tool calls live
   - Render structured relationship data as custom UI components
   - Pause execution for HITL approval before destructive SpiceDB mutations
 
-AUTH FLOW (per-request headers — no Vertex session state needed):
+AUTH FLOW (per-request headers — no server-side session state needed):
   CopilotKit frontend sends:
     x-agent-authorization: Bearer <agent_token>   ← PingOne Exchange 1 result
 
   ag_ui_adk extract_headers puts it into ADK session state as:
     state["headers"]["x-agent-authorization"]
 
-  inject_mcp_auth (before_agent_callback) reads this, runs Exchange 2:
-    agent_token → mcp_token (aud = MCP bridge resource server)
+  inject_mcp_auth (before_agent_callback) reads this and runs the DaVinci token
+  exchange (agent_token + k8s SA actor_token → mcp_token, aud = gateway MCP).
 
-  McpToolset is rebuilt per-turn with Authorization: Bearer <mcp_token>
+  McpToolset is rebuilt per-turn with Authorization: Bearer <mcp_token>.
 
 DEPLOYMENT:
-  See deploy.sh — builds a container image and deploys to Cloud Run.
+  Containerised and run in-cluster. See k8s/registry-agent.yaml.
 
 RUNNING LOCALLY:
   uvicorn server:app --reload --port 8080

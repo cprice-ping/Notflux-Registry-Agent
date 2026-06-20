@@ -15,23 +15,29 @@ Environment variables (all required unless noted):
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
 from contextlib import asynccontextmanager
-from typing import Literal
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
-from pydantic import BaseModel, field_validator
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
+
+from models import (
+    ObjectType,
+    PermissionCheckArgs,
+    RelationshipUpdateItem,
+    set_valid_tokens,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -40,15 +46,23 @@ SPICEDB_ENDPOINT: str = os.environ["SPICEDB_ENDPOINT"].rstrip("/")
 SPICEDB_API_KEY: str  = os.environ["SPICEDB_API_KEY"]
 MCP_API_KEY: str      = os.environ.get("MCP_API_KEY", "")
 
-# Populated at startup from the live SpiceDB schema; used by Pydantic validators.
-VALID_TOKENS: list[str] = []
-
 
 def _spicedb_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {SPICEDB_API_KEY}",
         "Content-Type":  "application/json",
     }
+
+
+def _authenticated_human() -> str:
+    """Return the X-Remote-User identity injected by the gateway, or "".
+
+    The gateway (PingOne Advanced Services) injects X-Remote-User after it has
+    validated the caller's token. This is the server-side enforcement point for
+    privileged mutations — it does not rely on the LLM honouring its prompt.
+    """
+    req = get_http_request()
+    return (req.headers.get("X-Remote-User", "") if req else "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -91,53 +105,15 @@ class _BearerAuth(BaseHTTPMiddleware):
         if MCP_API_KEY:
             header = request.headers.get("Authorization", "")
             token  = header.removeprefix("Bearer ").strip()
-            if token != MCP_API_KEY:
+            # Constant-time comparison to avoid leaking the key via timing.
+            if not hmac.compare_digest(token, MCP_API_KEY):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
 
-# ---------------------------------------------------------------------------
-# Pydantic input models
-# ---------------------------------------------------------------------------
-
-ObjectType = Literal["agent", "user", "mcp_server", "mcp_tool"]
-SubjectType = Literal["agent", "user"]
-
-
-class PermissionCheckArgs(BaseModel):
-    resource_type: ObjectType
-    resource_id: str
-    permission: str
-    subject_type: SubjectType
-    subject_id: str
-
-    @field_validator("permission")
-    @classmethod
-    def permission_must_be_valid(cls, v: str) -> str:
-        if VALID_TOKENS and v not in VALID_TOKENS:
-            raise ValueError(
-                f"Unknown permission '{v}'. Valid names from schema: {VALID_TOKENS}"
-            )
-        return v
-
-
-class RelationshipUpdateItem(BaseModel):
-    operation: Literal["OPERATION_TOUCH", "OPERATION_DELETE"] = "OPERATION_TOUCH"
-    resource_type: ObjectType
-    resource_id: str
-    relation: str
-    subject_type: SubjectType
-    subject_id: str
-    subject_relation: str = ""
-
-    @field_validator("relation")
-    @classmethod
-    def relation_must_be_valid(cls, v: str) -> str:
-        if VALID_TOKENS and v not in VALID_TOKENS:
-            raise ValueError(
-                f"Unknown relation '{v}'. Valid names from schema: {VALID_TOKENS}"
-            )
-        return v
+# Pydantic input models (PermissionCheckArgs, RelationshipUpdateItem) and the
+# schema-token validation live in models.py so they are unit-testable without
+# the FastMCP server. They are imported above.
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +173,12 @@ async def write_schema(schema: str) -> str:
             permission execute = direct_agent + parent_server->authorized_agent
         }
     """
+    # Mutations require an authenticated human administrator. Enforced here in
+    # the bridge — independent of the agent's system prompt — so a model error
+    # or prompt injection cannot rewrite the schema unattended.
+    if not _authenticated_human():
+        return ("Error: schema mutations require an authenticated human "
+                "administrator (no X-Remote-User present). Refusing to write.")
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{SPICEDB_ENDPOINT}/v1/schema/write",
@@ -255,6 +237,13 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
     _req = get_http_request()
     authenticated_user  = _req.headers.get("X-Remote-User") if _req else None
     authenticated_agent = _req.headers.get("X-Remote-Agent") if _req else None
+
+    # Mutations require an authenticated human administrator. Enforced here in
+    # the bridge — independent of the agent's system prompt — so a model error
+    # or prompt injection cannot rewrite the permission graph unattended.
+    if not (authenticated_user and authenticated_user.strip()):
+        return ("Error: relationship mutations require an authenticated human "
+                "administrator (no X-Remote-User present). Refusing to write.")
 
     payload: list[dict] = []
     for u in updates:
@@ -419,8 +408,7 @@ def create_app() -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app):
-        global VALID_TOKENS
-        VALID_TOKENS = await get_live_schema_tokens()
+        set_valid_tokens(await get_live_schema_tokens())
         async with inner.lifespan(app):
             yield
 
