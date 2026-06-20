@@ -37,7 +37,14 @@ async def _schema():
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    yield
+    try:
+        yield
+    finally:
+        # Dispose the global engine so no pooled asyncpg connection (bound to
+        # this test's event loop) leaks into the next test's loop. pytest-asyncio
+        # gives each test function a fresh loop; reusing a pooled connection
+        # across loops raises "attached to a different loop".
+        await engine.dispose()
 
 
 async def test_register_resolves_with_safe_sub_hash():
