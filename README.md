@@ -94,7 +94,7 @@ All components run in the `ping-devops-cprice` Kubernetes namespace.
 ├── k8s/
 │   ├── deployment.yaml         # SpiceDB deployment + ClusterIP service
 │   ├── frontend.yaml           # Frontend deployment, service, ingress
-│   ├── registry-agent.yaml     # Agent deployment, service, ingress
+│   ├── registry-agent.yaml     # Agent deployment + ClusterIP service (no public ingress)
 │   ├── mcp-bridge.yaml         # MCP Bridge deployment, service, ingress
 │   ├── registry-pip.yaml       # Registry PIP deployment, service, ingress
 │   ├── registry-pip-postgres.yaml  # In-cluster PostgreSQL StatefulSet

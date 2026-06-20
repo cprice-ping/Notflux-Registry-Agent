@@ -202,41 +202,10 @@ spec:
       targetPort: http
       protocol: TCP
 
----
-###############################################################################
-# Ingress
-# PingGateway routes inbound traffic to this service.
-# The frontend's CopilotKit remoteEndpoints URL points here.
-###############################################################################
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: registry-agent
-  namespace: ping-devops-cprice
-  labels:
-    app.kubernetes.io/name: registry-agent
-    app.kubernetes.io/component: agent
-    app.kubernetes.io/part-of: notflux-registry
-  annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    # AG-UI streams SSE — disable buffering
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
-spec:
-  ingressClassName: nginx-public
-  tls:
-    - hosts:
-        - notflux-registry-agent.ping-devops.com
-      secretName: notflux-registry-agent-tls
-  rules:
-    - host: notflux-registry-agent.ping-devops.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: registry-agent
-                port:
-                  name: http
+# NOTE: No Ingress is defined for the agent. The AG-UI endpoint performs
+# privileged SpiceDB mutations and is reached only via the in-cluster
+# ClusterIP Service (the frontend's /api/copilotkit proxy talks to it).
+# Exposing it publicly would put the Gemini-backed agent loop on the open
+# internet behind only a bearer token. If external access is ever required,
+# front it with the gateway rather than a public nginx Ingress, and apply
+# that Ingress manually.
