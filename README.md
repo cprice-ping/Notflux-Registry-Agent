@@ -177,6 +177,23 @@ PKCE login (PingOne)   →    Exchange 1:                 →   DaVinci Exchange
 - DaVinci hashes `actor_token.sub` (SHA-256 hex) and embeds it as `act.sub_hash` in the issued `mcp_token`. This is the canonical workload identifier used in SpiceDB tuples and P1AZ policy decisions — the raw sub (which contains colons or slashes) is preserved as `act.sub` for audit but never used as a SpiceDB object ID.
 - **When PingOne natively supports third-party `actor_token` (RFC 8693):** replace the DaVinci flow with a PingOne token policy that uses PEL `${#crypto.sha256Hex(actor.sub)}` to compute the same hash. The `act.sub_hash` claim shape stays identical — no downstream changes needed.
 
+**Delegation semantics (RFC 8693):** the exchanged token encodes proper delegation —
+`sub` is the **human** who delegated, and the `act` (actor) claim is the **agent** acting
+on their behalf (`act.sub` raw for audit, `act.sub_hash` as the SpiceDB-safe agent id).
+
+### Where authorization decisions are made
+
+All access-control decisions are made by **P1AZ — at the gateway and at the resource
+server**:
+- **PingGateway** (PingOne Advanced Services) validates the inbound token, runs the
+  per-turn token exchange, and applies policy before forwarding the request.
+- **Kong + PingOne Authorize Hybrid Gateway** evaluates ABAC policy on the Registry PIP
+  REST surface.
+
+The Governor agent and the MCP servers (SpiceDB bridge, Registry PIP) are **deliberately
+thin executors** — they carry out instructions and never make authorization decisions
+themselves. The agent's prompt rules are UX guardrails, not a security boundary.
+
 ---
 
 ## Components
@@ -215,7 +232,7 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - On startup, calls SpiceDB to read the live schema and extracts all `relation`/`permission` token names into `VALID_TOKENS`.
 - Pydantic v2 models (`PermissionCheckArgs`, `RelationshipUpdateItem`) validate all inputs. The `permission` and `relation` fields are checked against `VALID_TOKENS`, rejecting invented names with a clear error.
 - `resource_type` and `subject_type` are `Literal` types — FastMCP compiles these to an explicit enum in the JSON Schema sent to the LLM.
-- `subject_id="me"` is resolved server-side from `X-Remote-Agent` / `X-Remote-User` headers injected by PingOne Advanced Services gateway.
+- **The bridge is a pure executor — it makes no authorization decisions.** Access is decided upstream by P1AZ (at the PingGateway and at the resource server) before a request ever reaches the bridge; the bridge validates input shape and carries out the requested SpiceDB read/write. Delegated identity travels in the exchanged token claims (`sub` = the human delegator, `act.sub` / `act.sub_hash` = the agent actor), not in request headers.
 
 ### Registry PIP — `registry_service/`
 

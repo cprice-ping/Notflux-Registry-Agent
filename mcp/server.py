@@ -2,8 +2,15 @@
 mcp/server.py
 
 SpiceDB MCP Bridge – exposes SpiceDB permission management as MCP tools over
-streamable HTTP transport so that remote agents (e.g. Google Vertex AI Agent
-Builder) can provision and verify permissions via natural language.
+streamable HTTP transport so that remote agents can provision and verify
+permissions via natural language.
+
+This server is a pure executor: it makes NO authorization decisions. Access is
+decided upstream by P1AZ (at the PingGateway and at the resource server) before
+a request reaches here; the bridge only validates input shape and performs the
+requested SpiceDB read/write. Delegated identity travels in the exchanged token
+claims (sub = human delegator, act.sub / act.sub_hash = agent actor), not in
+request headers.
 
 Environment variables (all required unless noted):
   SPICEDB_ENDPOINT  – ClusterIP URL of the SpiceDB HTTP gateway,
@@ -162,11 +169,9 @@ async def write_schema(schema: str) -> str:
             permission execute = direct_agent + parent_server->authorized_agent
         }
     """
-    # NOTE: a server-side "authenticated human" guard (require X-Remote-User
-    # before mutating) is intentionally deferred until PingGateway is configured
-    # to inject the X-Remote-User identity header into bridge requests. Until
-    # then such a guard would block all mutations. Re-add it alongside that
-    # gateway change.
+    # By design, no authorization check happens here — the bridge is an
+    # executor. P1AZ at the gateway/resource server authorizes the caller before
+    # the request reaches this tool.
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{SPICEDB_ENDPOINT}/v1/schema/write",
@@ -191,12 +196,14 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
         resource_id      – Object ID of the resource  (e.g. "search_web")
         relation         – Relation name from the schema (e.g. "direct_agent")
         subject_type     – "agent" or "user"
-        subject_id       – Object ID of the subject, or "me" to resolve from headers
+        subject_id       – Object ID of the subject, or "me" (see note below)
         subject_relation – (optional) sub-relation for group expansion
 
-    subject_id="me" resolves automatically:
-        subject_type="agent" → value of X-Remote-Agent header
-        subject_type="user"  → value of X-Remote-User header
+    subject_id="me" is a convenience that maps to gateway-provided identity
+    headers (X-Remote-Agent / X-Remote-User). NOTE: the current PingGateway/P1AZ
+    deployment delivers delegated identity in the exchanged token claims
+    (sub = human, act.sub / act.sub_hash = agent), not these headers, so "me" is
+    inert here — pass explicit subject IDs.
 
     Example – grant agent:agent-001 direct execute access to mcp_tool:search_web:
         [
@@ -222,11 +229,11 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
           }
         ]
     """
-    # NOTE: a server-side "authenticated human" guard (require X-Remote-User
-    # before mutating) is intentionally deferred until PingGateway injects the
-    # X-Remote-User identity header into bridge requests; until then it would
-    # block all mutations. The header values below are still used to resolve
-    # subject_id="me".
+    # No authorization check here — the bridge is an executor; P1AZ at the
+    # gateway/resource server authorizes the caller upstream. The header reads
+    # below only back the legacy subject_id="me" convenience (see docstring);
+    # the current gateway carries identity in the token, so they are usually
+    # empty and "me" should not be relied on.
     _req = get_http_request()
     authenticated_user  = _req.headers.get("X-Remote-User") if _req else None
     authenticated_agent = _req.headers.get("X-Remote-Agent") if _req else None
@@ -287,9 +294,10 @@ async def check_permission(args: PermissionCheckArgs) -> str:
         PERMISSIONSHIP_NO_PERMISSION
         PERMISSIONSHIP_CONDITIONAL_PERMISSION
 
-    Use subject_id="me" to check the calling agent or user automatically:
-        subject_type="agent", subject_id="me"  → resolved from X-Remote-Agent header
-        subject_type="user",  subject_id="me"  → resolved from X-Remote-User header
+    subject_id="me" maps to gateway-provided identity headers (X-Remote-Agent /
+    X-Remote-User). NOTE: the current gateway delivers delegated identity in the
+    token claims (sub = human, act.sub / act.sub_hash = agent), not these
+    headers, so "me" is inert here — pass an explicit subject_id.
 
     Example – verify agent:agent-001 can execute mcp_tool:search_web:
         resource_type = "mcp_tool"

@@ -20,8 +20,10 @@ TOKEN FLOW:
                                                   │
                                                   ▼
                                         SpiceDB MCP Bridge (fronted by PingGateway)
-                                        Gateway forwards X-Remote-User / X-Remote-Agent
-                                        into SpiceDB permission mutations.
+                                        PingGateway/P1AZ authorizes, then forwards the
+                                        exchanged token; delegated identity is in the
+                                        token claims (sub = human, act = agent). The
+                                        bridge is a pure executor — it decides nothing.
 
 DEPLOYMENT:
   Containerised and run in-cluster. See k8s/registry-agent.yaml.
@@ -313,9 +315,10 @@ You have exclusive access to the SpiceDB relationship graph through your tools.
 ────────────────────────────────────────────────────────────────────────────
 IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
-• When a user says "me", "this agent", or "myself":
-    - For agent subjects  → use subject_id="me"  (resolved from X-Remote-Agent)
-    - For user subjects   → use subject_id="me"  (resolved from X-Remote-User)
+• Always use explicit subject IDs. When a user refers to an entity by name,
+  resolve it first with find_entity_by_name. The bridge does not resolve a
+  "me" alias in this deployment (delegated identity lives in the gateway-issued
+  token, which the bridge does not unpack), so do not rely on subject_id="me".
 
 • When provisioning access for the main operational Notflux agent, use its
   static Vertex AI resource ID as the subject_id:
@@ -324,9 +327,12 @@ IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
 SAFETY RULES  (never bypass these)
 ────────────────────────────────────────────────────────────────────────────
-1. Only call update_relationships or write_schema if the request originates
-   from a privileged human administrator (X-Remote-User is present and
-   non-empty). Reject mutations from unauthenticated callers.
+1. Authorization is enforced upstream by PingGateway / PingOne Authorize (P1AZ):
+   a request only reaches you after the gateway has authenticated and authorized
+   the delegating human (token sub) and the agent actor (token act). You are NOT
+   the enforcement point — do not attempt your own header-based gatekeeping.
+   Operate under that delegated authority and follow the confirmation guardrail
+   in rule 2 before any destructive change.
 
 2. Before any destructive operation (OPERATION_DELETE, schema overwrite),
    call read_relationships or read_schema first and summarise what will
