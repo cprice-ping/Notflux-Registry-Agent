@@ -94,7 +94,7 @@ All components run in the `ping-devops-cprice` Kubernetes namespace.
 ├── k8s/
 │   ├── deployment.yaml         # SpiceDB deployment + ClusterIP service
 │   ├── frontend.yaml           # Frontend deployment, service, ingress
-│   ├── registry-agent.yaml     # Agent deployment, service, ingress
+│   ├── registry-agent.yaml     # Agent deployment + ClusterIP service (no public ingress)
 │   ├── mcp-bridge.yaml         # MCP Bridge deployment, service, ingress
 │   ├── registry-pip.yaml       # Registry PIP deployment, service, ingress
 │   ├── registry-pip-postgres.yaml  # In-cluster PostgreSQL StatefulSet
@@ -122,21 +122,27 @@ The SpiceDB schema (`schema/schema.zed`) defines four object types:
 
 ```
 agent
-  └── owner: user                      — which human owns this agent
+  ├── owner: user                      — which human owns this agent
+  └── active_driver: user              — ephemeral driver, supplied via P1AZ contextual tuples
 
 mcp_server
   ├── authorized_agent: agent          — agent has blanket access to all tools on this server
   ├── authorized_user: user            — user can view this server
-  └── public_to_all_users: user:*      — open to all authenticated users
-      └── view_server (permission) = authorized_user + public_to_all_users
+  ├── public_to_all_users: user:*      — open to all authenticated users
+  ├── view_server (permission)      = authorized_user + public_to_all_users
+  └── agent_can_connect (permission) = authorized_agent
 
 mcp_tool
   ├── parent_server: mcp_server        — which server this tool belongs to
-  └── direct_agent: agent              — agent has direct access to this specific tool
-      └── execute (permission) = direct_agent + parent_server->authorized_agent
+  ├── direct_agent: agent              — agent has direct access to this specific tool
+  └── execute (permission) = (direct_agent + parent_server->authorized_agent)
+                             & parent_server->view_server
 ```
 
-An agent can execute a tool if it has **either** a `direct_agent` relationship on the tool **or** an `authorized_agent` relationship on the tool's parent server.
+An agent can execute a tool when it has **either** a `direct_agent` relationship on the
+tool **or** an `authorized_agent` relationship on the tool's parent server — **and** the
+parent server is viewable (`view_server`). The `view_server` conjunct ensures a tool is
+never executable on a server the caller cannot see.
 
 ---
 
@@ -170,6 +176,23 @@ PKCE login (PingOne)   →    Exchange 1:                 →   DaVinci Exchange
 - The Governor agent reads its k8s Service Account token from `/var/run/secrets/tokens/davinci-token` (projected volume, kubelet-rotated, audience `davinci-sts`) and passes it as `actor_token` to the DaVinci policy flow.
 - DaVinci hashes `actor_token.sub` (SHA-256 hex) and embeds it as `act.sub_hash` in the issued `mcp_token`. This is the canonical workload identifier used in SpiceDB tuples and P1AZ policy decisions — the raw sub (which contains colons or slashes) is preserved as `act.sub` for audit but never used as a SpiceDB object ID.
 - **When PingOne natively supports third-party `actor_token` (RFC 8693):** replace the DaVinci flow with a PingOne token policy that uses PEL `${#crypto.sha256Hex(actor.sub)}` to compute the same hash. The `act.sub_hash` claim shape stays identical — no downstream changes needed.
+
+**Delegation semantics (RFC 8693):** the exchanged token encodes proper delegation —
+`sub` is the **human** who delegated, and the `act` (actor) claim is the **agent** acting
+on their behalf (`act.sub` raw for audit, `act.sub_hash` as the SpiceDB-safe agent id).
+
+### Where authorization decisions are made
+
+All access-control decisions are made by **P1AZ — at the gateway and at the resource
+server**:
+- **PingGateway** (PingOne Advanced Services) validates the inbound token, runs the
+  per-turn token exchange, and applies policy before forwarding the request.
+- **Kong + PingOne Authorize Hybrid Gateway** evaluates ABAC policy on the Registry PIP
+  REST surface.
+
+The Governor agent and the MCP servers (SpiceDB bridge, Registry PIP) are **deliberately
+thin executors** — they carry out instructions and never make authorization decisions
+themselves. The agent's prompt rules are UX guardrails, not a security boundary.
 
 ---
 
@@ -209,7 +232,7 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - On startup, calls SpiceDB to read the live schema and extracts all `relation`/`permission` token names into `VALID_TOKENS`.
 - Pydantic v2 models (`PermissionCheckArgs`, `RelationshipUpdateItem`) validate all inputs. The `permission` and `relation` fields are checked against `VALID_TOKENS`, rejecting invented names with a clear error.
 - `resource_type` and `subject_type` are `Literal` types — FastMCP compiles these to an explicit enum in the JSON Schema sent to the LLM.
-- `subject_id="me"` is resolved server-side from `X-Remote-Agent` / `X-Remote-User` headers injected by PingOne Advanced Services gateway.
+- **The bridge is a pure executor — it makes no authorization decisions.** Access is decided upstream by P1AZ (at the PingGateway and at the resource server) before a request ever reaches the bridge; the bridge validates input shape and carries out the requested SpiceDB read/write. Delegated identity travels in the exchanged token claims (`sub` = the human delegator, `act.sub` / `act.sub_hash` = the agent actor), not in request headers.
 
 ### Registry PIP — `registry_service/`
 
@@ -274,14 +297,14 @@ kubectl create secret generic registry-pip-secrets \
 
 # Registry Agent secrets
 # REGISTRY_PIP_API_KEY: copy from registry-pip-secrets MCP_API_KEY
+# NOTE: the token exchange runs through the DaVinci flow, so the legacy
+# PINGONE_ENV_ID / PINGONE_CLIENT_ID / PINGONE_CLIENT_SECRET / PINGONE_MCP_SCOPE
+# keys are no longer consumed by the agent and have been dropped.
 kubectl create secret generic registry-agent-secrets \
   --namespace ping-devops-cprice \
   --from-literal=GOOGLE_API_KEY="<gemini-api-key>" \
   --from-literal=MCP_BRIDGE_URL="https://<your-gateway-host>/mcp/agent-registry" \
   --from-literal=WEATHER_MCP_URL="https://<your-gateway-host>/mcp/weather" \
-  --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
-  --from-literal=PINGONE_CLIENT_ID="<token-exchange-client-id>" \
-  --from-literal=PINGONE_CLIENT_SECRET="<token-exchange-client-secret>" \
   --from-literal=PINGONE_AGENT_AUDIENCE="<aud-claim-for-agent-token>" \
   --from-literal=DAVINCI_POLICY_URL="https://orchestrate-api.pingone.com/v1/company/<env-id>/policy/<flow-id>/start" \
   --from-literal=DAVINCI_POLICY_API_KEY="<davinci-flow-api-key>" \

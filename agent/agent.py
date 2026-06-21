@@ -1,38 +1,43 @@
 """
-agent/main.py
+agent/agent.py
 
-Registry Governor – Google ADK agent deployed to Vertex AI Agent Engine.
+Registry Governor – Google ADK agent, deployed to Kubernetes (see
+k8s/registry-agent.yaml) and served over the AG-UI protocol by server.py.
 
 TOKEN FLOW:
-  Frontend (Next.js)                    Vertex Agent Engine
+  Frontend (Next.js)                    Registry Governor (this agent)
   ──────────────────                    ──────────────────────────────────────
-  OIDC login (PingOne)                  Session state:
-    id_token ──[Exchange 1]──────────►  pingone_authorization: "Bearer agent_token"
+  OIDC login (PingOne)                  ag_ui_adk injects the inbound header
+    id_token ──[Exchange 1]──────────►  x-agent-authorization into session state.
     → agent_token (aud=registry-agent)            │
-                                                  │  inject_mcp_auth reads state,
-                                                  │  performs Exchange 2 per turn:
-                                                  │  agent_token ──[Exchange 2]──► mcp_token
-                                                  │  (aud=registry-mcp)                │
-                                                  ▼                                    │
-  POST /api/sessions                    McpToolset(                                    │
-    pingone_authorization ──────────►     headers={"Authorization": mcp_token})        │
-                                                  │                                    │
-  POST /api/chat ──────────────────────────────►  │                                    │
-                                                  ▼                                    ▼
-                                        SpiceDB MCP Bridge validates aud=registry-mcp
-                                        Forwards X-Remote-User / X-Remote-Agent headers
-                                        into SpiceDB permission mutations
+                                                  │  inject_mcp_auth reads it and runs a
+                                                  │  DaVinci token exchange (RFC 8693) per turn:
+                                                  │    subject_token = agent_token (human)
+                                                  │    actor_token   = k8s SA OIDC token
+                                                  │      └─► mcp_token (aud = gateway MCP)
+                                                  ▼
+                                        McpToolset(headers={"Authorization": mcp_token})
+                                                  │
+                                                  ▼
+                                        SpiceDB MCP Bridge (fronted by PingGateway)
+                                        PingGateway/P1AZ authorizes, then forwards the
+                                        exchanged token; delegated identity is in the
+                                        token claims (sub = human, act = agent). The
+                                        bridge is a pure executor — it decides nothing.
 
 DEPLOYMENT:
-  See deploy.sh — uses `adk deploy agent` targeting Vertex AI Agent Engine.
+  Containerised and run in-cluster. See k8s/registry-agent.yaml.
 
 ENVIRONMENT VARIABLES:
-  Required for PingOne token exchange (Exchange 2):
-    PINGONE_ENV_ID              PingOne environment UUID
-    PINGONE_CLIENT_ID           OAuth client used for the exchange
-    PINGONE_CLIENT_SECRET       Client secret
-    PINGONE_AGENT_AUDIENCE      Expected aud in the agent_token (aud check)
-    PINGONE_MCP_SCOPE           Scope to request → resolves to MCP resource server aud
+  DaVinci token exchange (agent_token + k8s SA actor_token → mcp_token):
+    DAVINCI_POLICY_URL          DaVinci flow "start" endpoint
+    DAVINCI_POLICY_API_KEY      DaVinci flow API key (X-SK-API-Key)
+    PINGONE_AGENT_AUDIENCE      Expected aud in the agent_token (pre-filter check)
+    PINGONE_SA_TOKEN_PATH       Path to the projected k8s SA token (actor_token)
+  Static-bearer MCP endpoint:
+    REGISTRY_PIP_URL / REGISTRY_PIP_API_KEY
+  Optional:
+    ALLOW_TOKEN_PASSTHROUGH     Dev-only: forward agent_token if DaVinci unset
 """
 
 from __future__ import annotations
@@ -71,6 +76,12 @@ _DAVINCI_POLICY_API_KEY = os.getenv('DAVINCI_POLICY_API_KEY', '')
 _PINGONE_AGENT_AUDIENCE = os.getenv('PINGONE_AGENT_AUDIENCE', '')
 _SA_TOKEN_PATH          = os.getenv('PINGONE_SA_TOKEN_PATH', '/var/run/secrets/tokens/davinci-token')
 
+# Opt-in escape hatch for local development only. When the DaVinci exchange is
+# not configured, the exchange normally fails closed (the agent token is the
+# wrong audience for the gateway, so forwarding it is a misconfiguration, not a
+# fallback). Set ALLOW_TOKEN_PASSTHROUGH=true to forward the agent token anyway.
+_ALLOW_TOKEN_PASSTHROUGH = os.getenv('ALLOW_TOKEN_PASSTHROUGH', '').lower() in ('1', 'true', 'yes')
+
 # Simple in-process cache: raw_agent_token → (mcp_token, expires_at)
 _mcp_token_cache: dict[str, tuple[str, float]] = {}
 
@@ -103,10 +114,23 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
     the verified workload identity before PingOne mints the outbound access_token.
     """
     if not _DAVINCI_POLICY_API_KEY:
-        logging.warning('exchange_for_mcp: DAVINCI_POLICY_API_KEY not set — using agent_token directly')
-        return agent_token
+        if _ALLOW_TOKEN_PASSTHROUGH:
+            logging.warning(
+                'exchange_for_mcp: DAVINCI_POLICY_API_KEY not set and '
+                'ALLOW_TOKEN_PASSTHROUGH enabled — forwarding agent_token directly '
+                '(dev only; wrong audience for the gateway).'
+            )
+            return agent_token
+        raise RuntimeError(
+            'exchange_for_mcp: DAVINCI_POLICY_API_KEY not set — refusing to forward '
+            'the agent_token (wrong audience for the gateway). Set the key, or set '
+            'ALLOW_TOKEN_PASSTHROUGH=true for local development.'
+        )
 
-    # Validate aud claim on the incoming human token before the round-trip.
+    # Sanity-check the aud claim on the incoming human token before the round-trip.
+    # NOTE: this decodes the JWT payload WITHOUT verifying the signature — it is a
+    # cheap pre-filter, not an authentication step. Real validation happens
+    # downstream at the DaVinci flow and the gateway.
     if _PINGONE_AGENT_AUDIENCE:
         try:
             parts  = agent_token.split(".")
@@ -291,9 +315,10 @@ You have exclusive access to the SpiceDB relationship graph through your tools.
 ────────────────────────────────────────────────────────────────────────────
 IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
-• When a user says "me", "this agent", or "myself":
-    - For agent subjects  → use subject_id="me"  (resolved from X-Remote-Agent)
-    - For user subjects   → use subject_id="me"  (resolved from X-Remote-User)
+• Always use explicit subject IDs. When a user refers to an entity by name,
+  resolve it first with find_entity_by_name. The bridge does not resolve a
+  "me" alias in this deployment (delegated identity lives in the gateway-issued
+  token, which the bridge does not unpack), so do not rely on subject_id="me".
 
 • When provisioning access for the main operational Notflux agent, use its
   static Vertex AI resource ID as the subject_id:
@@ -302,9 +327,12 @@ IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
 SAFETY RULES  (never bypass these)
 ────────────────────────────────────────────────────────────────────────────
-1. Only call update_relationships or write_schema if the request originates
-   from a privileged human administrator (X-Remote-User is present and
-   non-empty). Reject mutations from unauthenticated callers.
+1. Authorization is enforced upstream by PingGateway / PingOne Authorize (P1AZ):
+   a request only reaches you after the gateway has authenticated and authorized
+   the delegating human (token sub) and the agent actor (token act). You are NOT
+   the enforcement point — do not attempt your own header-based gatekeeping.
+   Operate under that delegated authority and follow the confirmation guardrail
+   in rule 2 before any destructive change.
 
 2. Before any destructive operation (OPERATION_DELETE, schema overwrite),
    call read_relationships or read_schema first and summarise what will
@@ -323,12 +351,13 @@ WORKFLOW
 • If a list/count query would require multiple read_relationships calls,
   perform them all before answering, then merge the results in your response.
 • Use check_permission to answer "can X do Y?" questions directly.
-  VALID PERMISSIONS AND RELATIONS by object type (read from the schema):
+  VALID PERMISSIONS AND RELATIONS by object type (mirror of schema/schema.zed —
+  prefer read_schema for the live truth if you are unsure):
     mcp_server  → relations:  authorized_agent, authorized_user, public_to_all_users
-                   permissions: view_server
+                   permissions: view_server, agent_can_connect
     mcp_tool    → relations:  parent_server, direct_agent
                    permissions: execute
-    agent       → relations:  owner
+    agent       → relations:  owner, active_driver
   To check if an agent can use an mcp_server, use permission="authorized_agent"
   (it is treated as a relation check). Never invent permission names like
   "access", "use", or "call" — they do not exist and will always return DENIED.

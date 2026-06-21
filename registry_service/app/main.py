@@ -21,6 +21,7 @@ Database:
 """
 from __future__ import annotations
 
+import hmac
 import os
 from contextlib import asynccontextmanager
 
@@ -58,7 +59,8 @@ class _McpBearerAuth(BaseHTTPMiddleware):
         if MCP_API_KEY:
             header = request.headers.get("Authorization", "")
             token = header.removeprefix("Bearer ").strip()
-            if token != MCP_API_KEY:
+            # Constant-time comparison to avoid leaking the key via timing.
+            if not hmac.compare_digest(token, MCP_API_KEY):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
