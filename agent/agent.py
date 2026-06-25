@@ -1,43 +1,38 @@
 """
-agent/agent.py
+agent/main.py
 
-Registry Governor – Google ADK agent, deployed to Kubernetes (see
-k8s/registry-agent.yaml) and served over the AG-UI protocol by server.py.
+Registry Governor – Google ADK agent deployed to Vertex AI Agent Engine.
 
 TOKEN FLOW:
-  Frontend (Next.js)                    Registry Governor (this agent)
+  Frontend (Next.js)                    Vertex Agent Engine
   ──────────────────                    ──────────────────────────────────────
-  OIDC login (PingOne)                  ag_ui_adk injects the inbound header
-    id_token ──[Exchange 1]──────────►  x-agent-authorization into session state.
+  OIDC login (PingOne)                  Session state:
+    id_token ──[Exchange 1]──────────►  pingone_authorization: "Bearer agent_token"
     → agent_token (aud=registry-agent)            │
-                                                  │  inject_mcp_auth reads it and runs a
-                                                  │  DaVinci token exchange (RFC 8693) per turn:
-                                                  │    subject_token = agent_token (human)
-                                                  │    actor_token   = k8s SA OIDC token
-                                                  │      └─► mcp_token (aud = gateway MCP)
-                                                  ▼
-                                        McpToolset(headers={"Authorization": mcp_token})
-                                                  │
-                                                  ▼
-                                        SpiceDB MCP Bridge (fronted by PingGateway)
-                                        PingGateway/P1AZ authorizes, then forwards the
-                                        exchanged token; delegated identity is in the
-                                        token claims (sub = human, act = agent). The
-                                        bridge is a pure executor — it decides nothing.
+                                                  │  inject_mcp_auth reads state,
+                                                  │  performs Exchange 2 per turn:
+                                                  │  agent_token ──[Exchange 2]──► mcp_token
+                                                  │  (aud=registry-mcp)                │
+                                                  ▼                                    │
+  POST /api/sessions                    McpToolset(                                    │
+    pingone_authorization ──────────►     headers={"Authorization": mcp_token})        │
+                                                  │                                    │
+  POST /api/chat ──────────────────────────────►  │                                    │
+                                                  ▼                                    ▼
+                                        SpiceDB MCP Bridge validates aud=registry-mcp
+                                        Forwards X-Remote-User / X-Remote-Agent headers
+                                        into SpiceDB permission mutations
 
 DEPLOYMENT:
-  Containerised and run in-cluster. See k8s/registry-agent.yaml.
+  See deploy.sh — uses `adk deploy agent` targeting Vertex AI Agent Engine.
 
 ENVIRONMENT VARIABLES:
-  DaVinci token exchange (agent_token + k8s SA actor_token → mcp_token):
-    DAVINCI_POLICY_URL          DaVinci flow "start" endpoint
-    DAVINCI_POLICY_API_KEY      DaVinci flow API key (X-SK-API-Key)
-    PINGONE_AGENT_AUDIENCE      Expected aud in the agent_token (pre-filter check)
-    PINGONE_SA_TOKEN_PATH       Path to the projected k8s SA token (actor_token)
-  Static-bearer MCP endpoint:
-    REGISTRY_PIP_URL / REGISTRY_PIP_API_KEY
-  Optional:
-    ALLOW_TOKEN_PASSTHROUGH     Dev-only: forward agent_token if DaVinci unset
+  Required for PingOne token exchange (Exchange 2):
+    PINGONE_ENV_ID              PingOne environment UUID
+    PINGONE_CLIENT_ID           OAuth client used for the exchange
+    PINGONE_CLIENT_SECRET       Client secret
+    PINGONE_AGENT_AUDIENCE      Expected aud in the agent_token (aud check)
+    PINGONE_MCP_SCOPE           Scope to request → resolves to MCP resource server aud
 """
 
 from __future__ import annotations
@@ -59,11 +54,11 @@ from google.genai import types
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BRIDGE_URL = os.getenv('MCP_BRIDGE_URL', 'https://notflux-gateway.ping-devops.com/mcp/agent-registry')
-WEATHER_URL = os.getenv('WEATHER_MCP_URL', 'https://notflux-gateway.ping-devops.com/mcp/weather')
+BRIDGE_URL        = os.getenv('MCP_BRIDGE_URL', 'https://notflux-gateway.ping-devops.com/mcp/agent-registry')
+WEATHER_URL       = os.getenv('WEATHER_MCP_URL', 'https://notflux-gateway.ping-devops.com/mcp/weather')
 
-# Registry-PIP MCP endpoint — static bearer token (no per-turn exchange).
-REGISTRY_PIP_URL     = os.getenv('REGISTRY_PIP_URL', 'https://notflux-registry-pip.ping-devops.com/mcp')
+# Registry-PIP — static bearer token (no per-turn exchange needed)
+REGISTRY_PIP_URL      = os.getenv('REGISTRY_PIP_URL', 'https://notflux-registry-pip.ping-devops.com/mcp')
 _REGISTRY_PIP_API_KEY = os.getenv('REGISTRY_PIP_API_KEY', '')
 
 # DaVinci-based token exchange — actor_token (k8s SA) + subject_token (human OIDC) → mcp_token
@@ -76,10 +71,7 @@ _DAVINCI_POLICY_API_KEY = os.getenv('DAVINCI_POLICY_API_KEY', '')
 _PINGONE_AGENT_AUDIENCE = os.getenv('PINGONE_AGENT_AUDIENCE', '')
 _SA_TOKEN_PATH          = os.getenv('PINGONE_SA_TOKEN_PATH', '/var/run/secrets/tokens/davinci-token')
 
-# Opt-in escape hatch for local development only. When the DaVinci exchange is
-# not configured, the exchange normally fails closed (the agent token is the
-# wrong audience for the gateway, so forwarding it is a misconfiguration, not a
-# fallback). Set ALLOW_TOKEN_PASSTHROUGH=true to forward the agent token anyway.
+# Opt-in escape hatch for local development only.
 _ALLOW_TOKEN_PASSTHROUGH = os.getenv('ALLOW_TOKEN_PASSTHROUGH', '').lower() in ('1', 'true', 'yes')
 
 # Simple in-process cache: raw_agent_token → (mcp_token, expires_at)
@@ -128,9 +120,7 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
         )
 
     # Sanity-check the aud claim on the incoming human token before the round-trip.
-    # NOTE: this decodes the JWT payload WITHOUT verifying the signature — it is a
-    # cheap pre-filter, not an authentication step. Real validation happens
-    # downstream at the DaVinci flow and the gateway.
+    # NOTE: decodes WITHOUT verifying signature — cheap pre-filter only.
     if _PINGONE_AGENT_AUDIENCE:
         try:
             parts  = agent_token.split(".")
@@ -149,7 +139,6 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
         logging.debug("exchange_for_mcp: cache hit")
         return cached[0]
 
-    # Read the SA token fresh each cache-miss (kubelet rotates it on disk).
     actor_token = _read_sa_token()
 
     logging.info(f"exchange_for_mcp: POST {_DAVINCI_POLICY_URL}")
@@ -226,6 +215,24 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
 
     mcp_auth = f"Bearer {mcp_token}"
 
+    # Decode and log the exchanged token claims (no sig verification — debug only).
+    try:
+        import json as _json
+        _payload = mcp_token.split(".")[1]
+        _payload += "=" * (-len(_payload) % 4)
+        _claims = _json.loads(base64.b64decode(_payload).decode())
+        logging.warning(
+            f"inject_mcp_auth: mcp_token claims — "
+            f"sub={_claims.get('sub')!r} "
+            f"aud={_claims.get('aud')!r} "
+            f"iss={_claims.get('iss')!r} "
+            f"scope={_claims.get('scope')!r} "
+            f"act={_claims.get('act')!r} "
+            f"exp={_claims.get('exp')}"
+        )
+    except Exception as _dec_exc:
+        logging.warning(f"inject_mcp_auth: mcp_token decode failed — {_dec_exc}")
+
     # ── Probe the actual MCP endpoint with auth (not /healthz which bypasses auth)
     try:
         # MCP initialize handshake — POST with the required Content-Type
@@ -235,10 +242,9 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
                 "Authorization": mcp_auth,
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
-                "MCP-Protocol-Version": "2025-06-18",
             },
             json={"jsonrpc": "2.0", "id": 0, "method": "initialize",
-                  "params": {"protocolVersion": "2025-06-18",
+                  "params": {"protocolVersion": "2025-03-26",
                              "clientInfo": {"name": "probe", "version": "0"},
                              "capabilities": {}}},
             timeout=8,
@@ -260,8 +266,8 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
         f"Authorization=Bearer ...[...{token_preview}]"
     )
 
-    agent   = callback_context._invocation_context.agent
-    non_mcp = [t for t in agent.tools if not isinstance(t, McpToolset)]
+    agent     = callback_context._invocation_context.agent
+    non_mcp   = [t for t in agent.tools if not isinstance(t, McpToolset)]
 
     new_toolsets: list[McpToolset] = [
         # SpiceDB bridge — per-turn PingOne exchanged token.
@@ -315,10 +321,9 @@ You have exclusive access to the SpiceDB relationship graph through your tools.
 ────────────────────────────────────────────────────────────────────────────
 IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
-• Always use explicit subject IDs. When a user refers to an entity by name,
-  resolve it first with find_entity_by_name. The bridge does not resolve a
-  "me" alias in this deployment (delegated identity lives in the gateway-issued
-  token, which the bridge does not unpack), so do not rely on subject_id="me".
+• When a user says "me", "this agent", or "myself":
+    - For agent subjects  → use subject_id="me"  (resolved from X-Remote-Agent)
+    - For user subjects   → use subject_id="me"  (resolved from X-Remote-User)
 
 • When provisioning access for the main operational Notflux agent, use its
   static Vertex AI resource ID as the subject_id:
@@ -327,12 +332,9 @@ IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
 SAFETY RULES  (never bypass these)
 ────────────────────────────────────────────────────────────────────────────
-1. Authorization is enforced upstream by PingGateway / PingOne Authorize (P1AZ):
-   a request only reaches you after the gateway has authenticated and authorized
-   the delegating human (token sub) and the agent actor (token act). You are NOT
-   the enforcement point — do not attempt your own header-based gatekeeping.
-   Operate under that delegated authority and follow the confirmation guardrail
-   in rule 2 before any destructive change.
+1. Only call update_relationships or write_schema if the request originates
+   from a privileged human administrator (X-Remote-User is present and
+   non-empty). Reject mutations from unauthenticated callers.
 
 2. Before any destructive operation (OPERATION_DELETE, schema overwrite),
    call read_relationships or read_schema first and summarise what will
@@ -350,113 +352,26 @@ WORKFLOW
   live data. Do not answer those requests from schema alone.
 • If a list/count query would require multiple read_relationships calls,
   perform them all before answering, then merge the results in your response.
+• Registry-PIP ID handling:
+    - DO NOT request, mention, or depend on any `sub_hash` field.
+    - `register_entity` and `resolve_entity` use canonical IDs directly.
+    - For DIDs (for example did:web:...), the registry performs reversible
+        encoding internally and returns canonical DID values to callers.
+    - If the caller asks to browse/search entities, use `list_entities` or
+        `find_entity_by_name`; use `delete_entity` only when asked to remove stale
+        records.
 • Use check_permission to answer "can X do Y?" questions directly.
-  VALID PERMISSIONS AND RELATIONS by object type (mirror of schema/schema.zed —
-  prefer read_schema for the live truth if you are unsure):
+  VALID PERMISSIONS AND RELATIONS by object type (read from the schema):
     mcp_server  → relations:  authorized_agent, authorized_user, public_to_all_users
-                   permissions: view_server, agent_can_connect
+                   permissions: view_server
     mcp_tool    → relations:  parent_server, direct_agent
                    permissions: execute
-    agent       → relations:  owner, active_driver
+    agent       → relations:  owner
   To check if an agent can use an mcp_server, use permission="authorized_agent"
   (it is treated as a relation check). Never invent permission names like
   "access", "use", or "call" — they do not exist and will always return DENIED.
 • Use read_relationships to list existing grants before provisioning new ones.
 • Summarise every relationship change in plain English after committing it.
-
-────────────────────────────────────────────────────────────────────────────
-ENTITY REGISTRY  (Registry-PIP tools: register_entity, resolve_entity)
-────────────────────────────────────────────────────────────────────────────
-The Registry-PIP is the name-to-ID source of truth for all entities in the
-Notflux cluster. Every agent, user, or MCP server that needs a human-readable
-name recorded, or whose ID you want to look up later, must be registered here.
-
-• register_entity(id, type, name, owner_guid, metadata, sub) — upsert an entity.
-  - id:         Stable unique identifier (Vertex resource path, PingOne GUID,
-                or any opaque string). This SAME id must be used in SpiceDB
-                relationships — UNLESS the entity has a sub_hash (see below).
-  - type:       One of: "agent", "user", "mcp_server", "mcp_tool"
-  - name:       Human-readable display name.
-  - owner_guid: PingOne user GUID of the human who owns this entity.
-  - metadata:   Optional JSON dict for extra context.
-  - sub:        OPTIONAL. The raw OIDC `sub` claim for workload identities,
-                e.g. "system:serviceaccount:namespace:name" for k8s Service
-                Accounts. When provided, the tool computes a SHA-256 hash of
-                the sub and stores it as `sub_hash`.
-
-  ⚠️  WORKLOAD IDENTITY RULE — When `sub` is provided, the response includes
-  `sub_hash=<64-hex-chars>`. You MUST use that sub_hash value — NOT the raw
-  sub, NOT the entity id — as the subject_id in all SpiceDB relationship tuples
-  for this entity. SpiceDB forbids colons in object IDs; the hash is the only
-  safe identifier. Record the sub_hash in a note before calling update_relationships.
-
-• resolve_entity(id) — look up a previously registered entity by id.
-  Use this before calling update_relationships when you need to confirm an
-  entity exists, or to display its human-readable name.
-
-• list_entities(type=None) — list all registered entities, optionally
-  filtered by type. Use this when an admin asks "what agents are registered?"
-  or "show me everything in the registry". No ID required.
-
-• find_entity_by_name(name, type=None) — case-insensitive substring search
-  on the entity name. Use this when an admin asks about an entity by its
-  human-readable name, e.g. "Tell me about the NotFlux Agent". Returns all
-  matching records so you can then resolve_entity or check permissions by ID.
-  ALWAYS use find_entity_by_name before resolve_entity when the admin has
-  given you a name rather than an ID.
-
-ONBOARDING WORKFLOW — follow this order every time a new agent or MCP server
-is being added to the cluster:
-
-  STEP 1 — Register in Registry-PIP:
-    register_entity(
-      id="<stable-resource-id>",
-      type="agent",          # or mcp_server / user / mcp_tool
-      name="<display-name>",
-      owner_guid="<owner-pingone-guid>",
-      sub="<oidc-sub-claim>",  # include if this is a k8s SA or workload identity
-    )
-    → If sub was provided, note the sub_hash from the response. You will use
-      it in Step 2 instead of the id.
-
-  STEP 2 — Grant permissions in SpiceDB:
-    For standard entities (no sub):
-      subject_id = "<stable-resource-id>"   # same as Step 1 id
-    For workload identities (sub was provided):
-      subject_id = "<sub_hash from Step 1 response>"  # the 64-hex-char hash
-
-    update_relationships(relationships=[
-      { "resource_type": "agent",
-        "resource_id":   "<stable-resource-id>",
-        "relation":      "owner",
-        "subject_type":  "user",
-        "subject_id":    "<subject_id as determined above>" }
-    ], operation="OPERATION_TOUCH")
-
-Never skip Step 1. An entity that exists in SpiceDB but not in Registry-PIP
-cannot be resolved by name or surfaced to P1AZ for policy decisions.
-
-DELETION WORKFLOW — follow this order whenever removing or re-registering an entity:
-
-  STEP 1 — Read existing SpiceDB relationships FIRST:
-    read_relationships(resource_type="<type>", resource_id="<id>")
-    Note every tuple returned — you will delete them all.
-
-  STEP 2 — Delete all SpiceDB relationships for this entity:
-    update_relationships([
-      { ...each tuple from Step 1..., "operation": "OPERATION_DELETE" }
-    ])
-    Also delete any relationships where this entity appears as the SUBJECT,
-    not just as the resource.
-
-  STEP 3 — Delete the Registry-PIP entity:
-    delete_entity(id="<id>")
-
-  STEP 4 — If re-registering: follow the ONBOARDING WORKFLOW above.
-
-Never delete the Registry-PIP record without first removing its SpiceDB
-relationships. Orphaned SpiceDB tuples referencing a deleted entity will cause
-stale policy decisions and cannot be cleaned up by name later.
 """,
     before_agent_callback=inject_mcp_auth,
     tools=[

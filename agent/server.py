@@ -179,20 +179,30 @@ async def mcp_servers(
 
     Registry PIP uses its static bearer key and is always fully live-probed.
     """
-    from agent import (
-        BRIDGE_URL, WEATHER_URL, REGISTRY_PIP_URL, _REGISTRY_PIP_API_KEY,
-        _exchange_for_mcp_token,
-    )
+    from agent import BRIDGE_URL, _exchange_for_mcp_token
+
+    WEATHER_URL       = os.getenv('WEATHER_MCP_URL', 'https://notflux-gateway.ping-devops.com/mcp/weather')
+    REGISTRY_PIP_URL  = os.getenv('REGISTRY_PIP_URL', 'https://notflux-registry-pip.ping-devops.com/mcp')
+    _REGISTRY_PIP_API_KEY = os.getenv('REGISTRY_PIP_API_KEY', '')
 
     pip_headers = {"Authorization": f"Bearer {_REGISTRY_PIP_API_KEY}"} if _REGISTRY_PIP_API_KEY else {}
 
     # Attempt Exchange 2 if we have an agent token.
     gateway_headers: dict = {}
+    mcp_token_claims: dict = {}
     if x_agent_authorization:
         agent_token = x_agent_authorization.removeprefix("Bearer ").strip()
         try:
             mcp_token = _exchange_for_mcp_token(agent_token)
             gateway_headers = {"Authorization": f"Bearer {mcp_token}"}
+            # Decode claims for display (no sig verification — informational only).
+            try:
+                import base64 as _b64, json as _json
+                _payload = mcp_token.split(".")[1]
+                _payload += "=" * (-len(_payload) % 4)
+                mcp_token_claims = _json.loads(_b64.urlsafe_b64decode(_payload))
+            except Exception:
+                pass
             logging.info("mcp-servers probe: exchange ok, probing with real gateway token")
         except Exception as exc:
             logging.warning(f"mcp-servers probe: exchange failed — {exc}; falling back to reachability-only")
@@ -211,6 +221,7 @@ async def mcp_servers(
                 "auth": "per-turn token exchange (PingOne)",
                 "tools": bridge_tools,
                 "reachable": len(bridge_tools) > 0,
+                "tokenClaims": mcp_token_claims,
             },
             {
                 "name": "Weather",
@@ -218,6 +229,7 @@ async def mcp_servers(
                 "auth": "per-turn token exchange (PingOne)",
                 "tools": weather_tools,
                 "reachable": len(weather_tools) > 0,
+                "tokenClaims": mcp_token_claims,
             },
             {
                 "name": "Registry PIP",

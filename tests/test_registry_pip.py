@@ -1,17 +1,15 @@
 """
-Integration tests for the Registry PIP entity tools (registry_service/app).
+Integration tests for Registry PIP entity tools (registry_service/app).
 
-Exercises the real register → resolve → delete path against a Postgres instance,
-asserting that a workload-identity `sub` is SHA-256 hashed into a SpiceDB-safe
-`sub_hash` (64 hex chars) and round-trips through resolve.
+Exercises the real register → resolve path against Postgres and verifies
+reversible DID handling:
+    - register_entity encodes unsafe IDs for storage
+    - resolve_entity returns the original caller-facing DID
 
-Requires DATABASE_URL (postgresql+asyncpg://...) — skipped otherwise, so the
-suite stays runnable locally without a database.
+Requires DATABASE_URL (postgresql+asyncpg://...) — skipped otherwise.
 """
-import hashlib
 import os
 import pathlib
-import re
 import sys
 
 import pytest
@@ -48,34 +46,53 @@ async def _schema():
 
 
 async def test_register_resolves_with_safe_sub_hash():
-    from app.mcp_server import delete_entity, register_entity, resolve_entity
+    from app.database import AsyncSessionLocal
+    from app.id_codec import to_storage_id
+    from app.mcp_server import register_entity, resolve_entity
+    from app.models import Entity
 
-    sub = "system:serviceaccount:ping-devops-cprice:notflux-registry-agent"
-    expected = hashlib.sha256(sub.encode()).hexdigest()
+    did = "did:web:reg.example.com:agents:napanode01"
+    storage_id = to_storage_id(did)
+    assert storage_id != did
 
-    try:
-        result = await _fn(register_entity)(
-            id="test-workload", type="agent", name="Workload Test",
-            owner_guid="owner-guid", sub=sub,
-        )
-        assert expected in result
-        assert re.fullmatch(r"[a-f0-9]{64}", expected)  # valid SpiceDB object id
+    result = await _fn(register_entity)(
+        id=did,
+        type="agent",
+        name="Napa Node",
+        owner_guid="owner-guid",
+    )
+    assert "registered" in result or "updated" in result
 
-        record = await _fn(resolve_entity)(id="test-workload")
-        assert record["sub_hash"] == expected
-        assert record["name"] == "Workload Test"
-    finally:
-        await _fn(delete_entity)(id="test-workload")
+    record = await _fn(resolve_entity)(id=did)
+    assert record["id"] == did
+    assert record["name"] == "Napa Node"
+
+    # Confirm encoded-at-rest behavior.
+    async with AsyncSessionLocal() as session:
+        entity = await session.get(Entity, storage_id)
+        assert entity is not None
+        await session.delete(entity)
+        await session.commit()
 
 
 async def test_register_without_sub_has_no_hash():
-    from app.mcp_server import delete_entity, register_entity, resolve_entity
+    from app.database import AsyncSessionLocal
+    from app.mcp_server import register_entity, resolve_entity
+    from app.models import Entity
 
-    try:
-        await _fn(register_entity)(
-            id="test-plain", type="user", name="Plain User", owner_guid="owner-guid",
-        )
-        record = await _fn(resolve_entity)(id="test-plain")
-        assert record["sub_hash"] is None
-    finally:
-        await _fn(delete_entity)(id="test-plain")
+    await _fn(register_entity)(
+        id="plain_user_001",
+        type="user",
+        name="Plain User",
+        owner_guid="owner-guid",
+    )
+
+    record = await _fn(resolve_entity)(id="plain_user_001")
+    assert record["id"] == "plain_user_001"
+
+    # Cleanup
+    async with AsyncSessionLocal() as session:
+        entity = await session.get(Entity, "plain_user_001")
+        if entity is not None:
+            await session.delete(entity)
+            await session.commit()

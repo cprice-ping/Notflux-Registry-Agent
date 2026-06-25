@@ -21,7 +21,6 @@ Database:
 """
 from __future__ import annotations
 
-import hmac
 import os
 from contextlib import asynccontextmanager
 
@@ -38,7 +37,6 @@ from .database import engine
 from .mcp_server import mcp
 from .models import Base
 from .rest_api import router
-from sqlalchemy import text
 
 MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "")
 
@@ -59,8 +57,7 @@ class _McpBearerAuth(BaseHTTPMiddleware):
         if MCP_API_KEY:
             header = request.headers.get("Authorization", "")
             token = header.removeprefix("Bearer ").strip()
-            # Constant-time comparison to avoid leaking the key via timing.
-            if not hmac.compare_digest(token, MCP_API_KEY):
+            if token != MCP_API_KEY:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
@@ -98,20 +95,6 @@ def create_app() -> Starlette:
         # Ensure DB schema is current on every boot (idempotent).
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # create_all does not ALTER existing tables — add new columns manually.
-            # Both statements are safe to re-run (IF NOT EXISTS / no-op if present).
-            await conn.execute(
-                text("ALTER TABLE entities ADD COLUMN IF NOT EXISTS raw_sub TEXT")
-            )
-            await conn.execute(
-                text("ALTER TABLE entities ADD COLUMN IF NOT EXISTS sub_hash TEXT")
-            )
-            await conn.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_entities_sub_hash "
-                    "ON entities (sub_hash) WHERE sub_hash IS NOT NULL"
-                )
-            )
         async with mcp_asgi.lifespan(app):
             yield
 

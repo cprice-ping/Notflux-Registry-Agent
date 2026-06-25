@@ -9,13 +9,13 @@ do not need to perform their own auth checks.
 """
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from fastmcp import FastMCP
 from sqlalchemy import func, select
 
 from .database import AsyncSessionLocal
+from .id_codec import to_external_id, to_storage_id
 from .models import Entity
 
 mcp = FastMCP(
@@ -24,9 +24,9 @@ mcp = FastMCP(
         "Registry Policy Information Point. "
         "Use register_entity to create or update entity records (agents, MCP servers, users, etc.). "
         "Use resolve_entity to look up a canonical entity record by its stable ID. "
-        "Use list_entities to browse all registered entities (optionally filtered by type) when you do not know the ID. "
-        "Use find_entity_by_name to search by human-readable name when an admin asks about an entity by name rather than ID. "
-        "Use delete_entity to permanently remove a stale record before re-registering it with updated fields. "
+        "Use list_entities to browse entities, optionally filtered by type. "
+        "Use find_entity_by_name to search by human-readable name when the caller does not know the ID. "
+        "Use delete_entity to remove stale records before re-registering updated data. "
         "Entity IDs are the same identifiers used in SpiceDB relationship tuples."
     ),
 )
@@ -39,7 +39,6 @@ async def register_entity(
     name: str,
     owner_guid: str,
     metadata: dict[str, Any] | None = None,
-    sub: str | None = None,
 ) -> str:
     """
     Create or update an entity record in the Registry.
@@ -54,49 +53,34 @@ async def register_entity(
         name:       Human-friendly display name shown in the dashboard.
         owner_guid: GUID of the owning principal.
         metadata:   Optional key/value bag for additional attributes (stored as JSONB).
-        sub:        Optional OIDC subject claim for workload identities (e.g. a k8s
-                    Service Account sub like
-                    "system:serviceaccount:namespace:name"). When provided, a
-                    SHA-256 hash is computed and stored as sub_hash. Use the
-                    returned sub_hash value — NOT the raw sub — as the subject_id
-                    in SpiceDB relationship tuples (SpiceDB forbids colons in IDs).
 
-    Returns a confirmation string with the entity ID and sub_hash (if applicable).
+    Returns a confirmation string with the entity ID and whether it was
+    newly created or updated.
     """
-    sub_hash: str | None = None
-    if sub:
-        sub_hash = hashlib.sha256(sub.encode()).hexdigest()
+    storage_id = to_storage_id(id)
 
     async with AsyncSessionLocal() as session:
-        existing = await session.get(Entity, id)
+        existing = await session.get(Entity, storage_id)
         if existing:
             existing.type = type
             existing.name = name
             existing.owner_guid = owner_guid
             existing.entity_metadata = metadata or {}
-            if sub is not None:
-                existing.raw_sub = sub
-                existing.sub_hash = sub_hash
             action = "updated"
         else:
             session.add(
                 Entity(
-                    id=id,
+                    id=storage_id,
                     type=type,
                     name=name,
                     owner_guid=owner_guid,
                     entity_metadata=metadata or {},
-                    raw_sub=sub,
-                    sub_hash=sub_hash,
                 )
             )
             action = "registered"
         await session.commit()
 
-    result = f"Entity '{id}' {action} successfully."
-    if sub_hash:
-        result += f" sub_hash={sub_hash} — use this value as subject_id in SpiceDB relationships."
-    return result
+    return f"Entity '{id}' {action} successfully."
 
 
 @mcp.tool()
@@ -111,104 +95,105 @@ async def resolve_entity(id: str) -> dict[str, Any]:
     Args:
         id: The canonical entity identifier to look up.
     """
+    storage_id = to_storage_id(id)
+
     async with AsyncSessionLocal() as session:
-        entity = await session.get(Entity, id)
+        # Try encoded lookup first, then raw for backward compatibility with
+        # records created before ID encoding was introduced.
+        entity = await session.get(Entity, storage_id)
+        if entity is None and storage_id != id:
+            entity = await session.get(Entity, id)
         if entity is None:
             raise ValueError(f"Entity '{id}' not found in the Registry.")
         return {
-            "id": entity.id,
+            "id": to_external_id(entity.id),
             "type": entity.type,
             "name": entity.name,
             "owner_guid": entity.owner_guid,
             "metadata": entity.entity_metadata or {},
-            "sub_hash": entity.sub_hash,
         }
 
 
 @mcp.tool()
-async def list_entities(type: str | None = None) -> list[dict[str, Any]]:
+async def list_entities(type: str = "", limit: int = 200) -> list[dict[str, Any]]:
     """
-    List all registered entities, optionally filtered by type.
-
-    Use this to browse what is in the Registry without needing to know IDs
-    upfront. Returns a list of entity records sorted by name.
+    List entity records from the Registry.
 
     Args:
-        type: Optional filter — one of "agent", "user", "mcp_server",
-              "mcp_tool". If omitted, all entities are returned.
-
-    Returns a list of dicts, each with id, type, name, owner_guid, metadata.
+        type: Optional entity type filter (e.g. "agent", "mcp_server", "user").
+        limit: Max rows to return (1-1000, default 200).
     """
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+
     async with AsyncSessionLocal() as session:
-        stmt = select(Entity).order_by(Entity.name)
-        if type is not None:
+        stmt = select(Entity)
+        if type:
             stmt = stmt.where(Entity.type == type)
+        stmt = stmt.order_by(Entity.id.asc()).limit(limit)
+
         rows = (await session.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": e.id,
-            "type": e.type,
-            "name": e.name,
-            "owner_guid": e.owner_guid,
-            "metadata": e.entity_metadata or {},
-            "sub_hash": e.sub_hash,
-        }
-        for e in rows
-    ]
+        return [
+            {
+                "id": to_external_id(e.id),
+                "type": e.type,
+                "name": e.name,
+                "owner_guid": e.owner_guid,
+                "metadata": e.entity_metadata or {},
+            }
+            for e in rows
+        ]
 
 
 @mcp.tool()
-async def find_entity_by_name(name: str, type: str | None = None) -> list[dict[str, Any]]:
+async def find_entity_by_name(name: str, type: str = "", limit: int = 200) -> list[dict[str, Any]]:
     """
-    Search for entities whose name contains the given string (case-insensitive).
-
-    Use this when an admin asks about an entity by its human-readable name
-    rather than by ID — e.g. "Tell me about the NotFlux Agent".
+    Search entities by case-insensitive name substring.
 
     Args:
-        name: Substring to search for within the entity name field.
-        type: Optional type filter — one of "agent", "user", "mcp_server",
-              "mcp_tool". Narrows results to a single entity class.
-
-    Returns a list of matching entity dicts (may be empty if nothing matches).
+        name: Name fragment to search for.
+        type: Optional entity type filter.
+        limit: Max rows to return (1-1000, default 200).
     """
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+
     async with AsyncSessionLocal() as session:
-        stmt = (
-            select(Entity)
-            .where(func.lower(Entity.name).contains(name.lower()))
-            .order_by(Entity.name)
-        )
-        if type is not None:
+        stmt = select(Entity).where(func.lower(Entity.name).contains(name.lower()))
+        if type:
             stmt = stmt.where(Entity.type == type)
+        stmt = stmt.order_by(Entity.name.asc()).limit(limit)
+
         rows = (await session.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": e.id,
-            "type": e.type,
-            "name": e.name,
-            "owner_guid": e.owner_guid,
-            "metadata": e.entity_metadata or {},
-            "sub_hash": e.sub_hash,
-        }
-        for e in rows
-    ]
+        return [
+            {
+                "id": to_external_id(e.id),
+                "type": e.type,
+                "name": e.name,
+                "owner_guid": e.owner_guid,
+                "metadata": e.entity_metadata or {},
+            }
+            for e in rows
+        ]
 
 
 @mcp.tool()
 async def delete_entity(id: str) -> str:
     """
-    Permanently remove an entity record from the Registry.
+    Delete an entity record by canonical ID.
 
-    Use this to clean up stale entries before re-registering with updated
-    fields (e.g. to add a sub / sub_hash to an existing entity).
-
-    Args:
-        id: The canonical entity identifier to delete.
-
-    Returns a confirmation string, or an error if the entity does not exist.
+    Supports both encoded-at-rest IDs and legacy raw IDs.
     """
+    storage_id = to_storage_id(id)
+
     async with AsyncSessionLocal() as session:
-        entity = await session.get(Entity, id)
+        entity = await session.get(Entity, storage_id)
+        if entity is None and storage_id != id:
+            entity = await session.get(Entity, id)
         if entity is None:
             raise ValueError(f"Entity '{id}' not found in the Registry.")
         await session.delete(entity)

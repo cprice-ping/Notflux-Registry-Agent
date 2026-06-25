@@ -81,12 +81,23 @@ interface Metrics {
   pendingGrants: number | null;
 }
 
+interface McpTokenClaims {
+  sub?: string;
+  aud?: string | string[];
+  iss?: string;
+  scope?: string;
+  act?: Record<string, unknown>;
+  exp?: number;
+  [key: string]: unknown;
+}
+
 interface McpServer {
   name: string;
   url: string;
   auth: string;
   tools: string[];
   reachable?: boolean;
+  tokenClaims?: McpTokenClaims;
 }
 
 interface RelationshipRow {
@@ -195,11 +206,23 @@ export default function DashboardPage() {
 
         const cached = sessionStorage.getItem("registry_person_token");
         if (cached) {
-          try {
-            await refreshAgentSession(cached);
-            setPersonToken(cached);
-            return;
-          } catch {
+          // Discard the cached token early if it's already expired so we
+          // don't send an expired subject_token to the PingOne exchange endpoint.
+          const isExpired = (() => {
+            try {
+              const payload = JSON.parse(atob(cached.split(".")[1]));
+              return typeof payload.exp === "number" && payload.exp * 1000 < Date.now();
+            } catch { return false; }
+          })();
+          if (!isExpired) {
+            try {
+              await refreshAgentSession(cached);
+              setPersonToken(cached);
+              return;
+            } catch {
+              sessionStorage.removeItem("registry_person_token");
+            }
+          } else {
             sessionStorage.removeItem("registry_person_token");
           }
         }
@@ -538,6 +561,20 @@ function McpInventoryPanel() {
                 <span className="text-gray-600 uppercase tracking-widest mr-1">Auth</span>
                 {s.auth}
               </p>
+              {s.tokenClaims && (
+                <div className="mt-1 space-y-0.5">
+                  {([
+                    ["sub",   s.tokenClaims.sub],
+                    ["aud",   Array.isArray(s.tokenClaims.aud) ? s.tokenClaims.aud.join(", ") : s.tokenClaims.aud],
+                    ["scope", s.tokenClaims.scope],
+                    ["act",   s.tokenClaims.act ? JSON.stringify(s.tokenClaims.act) : undefined],
+                  ] as [string, string | undefined][]).filter(([, v]) => v).map(([k, v]) => (
+                    <p key={k} className="font-mono text-xs text-gray-500 truncate">
+                      <span className="text-gray-600">{k}=</span>{v}
+                    </p>
+                  ))}
+                </div>
+              )}
               {s.tools.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
                   {s.tools.map((t) => (

@@ -16,11 +16,11 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_session
+from .id_codec import to_external_id, to_storage_id
 from .models import Entity
 from .schemas import EntityResponse
 
@@ -56,47 +56,16 @@ async def get_entity(
     _auth: Annotated[str, Depends(_require_auth)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> EntityResponse:
-    entity: Entity | None = await session.get(Entity, id)
+    storage_id = to_storage_id(id)
+    entity: Entity | None = await session.get(Entity, storage_id)
+    if entity is None and storage_id != id:
+        entity = await session.get(Entity, id)
     if entity is None:
         raise HTTPException(status_code=404, detail=f"Entity '{id}' not found.")
     return EntityResponse(
-        id=entity.id,
+        id=to_external_id(entity.id),
         type=entity.type,
         name=entity.name,
         owner_guid=entity.owner_guid,
         metadata=entity.entity_metadata,
     )
-
-
-@router.get(
-    "/entities",
-    response_model=list[EntityResponse],
-    summary="List or search entities",
-    description=(
-        "Returns a list of entity records. Supports optional filtering by "
-        "`type` and/or a case-insensitive name substring search via `name`. "
-        "Results are sorted by name."
-    ),
-)
-async def list_entities(
-    _auth: Annotated[str, Depends(_require_auth)],
-    session: Annotated[AsyncSession, Depends(get_session)],
-    type: Annotated[str | None, Query(description="Filter by entity type (agent, user, mcp_server, mcp_tool).")] = None,
-    name: Annotated[str | None, Query(description="Case-insensitive substring match on the entity name.")] = None,
-) -> list[EntityResponse]:
-    stmt = select(Entity).order_by(Entity.name)
-    if type is not None:
-        stmt = stmt.where(Entity.type == type)
-    if name is not None:
-        stmt = stmt.where(func.lower(Entity.name).contains(name.lower()))
-    rows = (await session.execute(stmt)).scalars().all()
-    return [
-        EntityResponse(
-            id=e.id,
-            type=e.type,
-            name=e.name,
-            owner_guid=e.owner_guid,
-            metadata=e.entity_metadata,
-        )
-        for e in rows
-    ]

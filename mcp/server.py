@@ -2,15 +2,8 @@
 mcp/server.py
 
 SpiceDB MCP Bridge – exposes SpiceDB permission management as MCP tools over
-streamable HTTP transport so that remote agents can provision and verify
-permissions via natural language.
-
-This server is a pure executor: it makes NO authorization decisions. Access is
-decided upstream by P1AZ (at the PingGateway and at the resource server) before
-a request reaches here; the bridge only validates input shape and performs the
-requested SpiceDB read/write. Delegated identity travels in the exchanged token
-claims (sub = human delegator, act.sub / act.sub_hash = agent actor), not in
-request headers.
+streamable HTTP transport so that remote agents (e.g. Google Vertex AI Agent
+Builder) can provision and verify permissions via natural language.
 
 Environment variables (all required unless noted):
   SPICEDB_ENDPOINT  – ClusterIP URL of the SpiceDB HTTP gateway,
@@ -27,11 +20,13 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_request
+from pydantic import BaseModel, field_validator
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -39,12 +34,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 
-from models import (
-    ObjectType,
-    PermissionCheckArgs,
-    RelationshipUpdateItem,
-    set_valid_tokens,
-)
+from id_codec import to_external_id, to_storage_id
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,6 +42,9 @@ from models import (
 SPICEDB_ENDPOINT: str = os.environ["SPICEDB_ENDPOINT"].rstrip("/")
 SPICEDB_API_KEY: str  = os.environ["SPICEDB_API_KEY"]
 MCP_API_KEY: str      = os.environ.get("MCP_API_KEY", "")
+
+# Populated at startup from the live SpiceDB schema; used by Pydantic validators.
+VALID_TOKENS: list[str] = []
 
 
 def _spicedb_headers() -> dict[str, str]:
@@ -101,15 +94,53 @@ class _BearerAuth(BaseHTTPMiddleware):
         if MCP_API_KEY:
             header = request.headers.get("Authorization", "")
             token  = header.removeprefix("Bearer ").strip()
-            # Constant-time comparison to avoid leaking the key via timing.
             if not hmac.compare_digest(token, MCP_API_KEY):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
 
 
-# Pydantic input models (PermissionCheckArgs, RelationshipUpdateItem) and the
-# schema-token validation live in models.py so they are unit-testable without
-# the FastMCP server. They are imported above.
+# ---------------------------------------------------------------------------
+# Pydantic input models
+# ---------------------------------------------------------------------------
+
+ObjectType = Literal["agent", "user", "mcp_server", "mcp_tool"]
+SubjectType = Literal["agent", "user"]
+
+
+class PermissionCheckArgs(BaseModel):
+    resource_type: ObjectType
+    resource_id: str
+    permission: str
+    subject_type: SubjectType
+    subject_id: str
+
+    @field_validator("permission")
+    @classmethod
+    def permission_must_be_valid(cls, v: str) -> str:
+        if VALID_TOKENS and v not in VALID_TOKENS:
+            raise ValueError(
+                f"Unknown permission '{v}'. Valid names from schema: {VALID_TOKENS}"
+            )
+        return v
+
+
+class RelationshipUpdateItem(BaseModel):
+    operation: Literal["OPERATION_TOUCH", "OPERATION_DELETE"] = "OPERATION_TOUCH"
+    resource_type: ObjectType
+    resource_id: str
+    relation: str
+    subject_type: SubjectType
+    subject_id: str
+    subject_relation: str = ""
+
+    @field_validator("relation")
+    @classmethod
+    def relation_must_be_valid(cls, v: str) -> str:
+        if VALID_TOKENS and v not in VALID_TOKENS:
+            raise ValueError(
+                f"Unknown relation '{v}'. Valid names from schema: {VALID_TOKENS}"
+            )
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +200,6 @@ async def write_schema(schema: str) -> str:
             permission execute = direct_agent + parent_server->authorized_agent
         }
     """
-    # By design, no authorization check happens here — the bridge is an
-    # executor. P1AZ at the gateway/resource server authorizes the caller before
-    # the request reaches this tool.
     async with httpx.AsyncClient() as client:
         r = await client.post(
             f"{SPICEDB_ENDPOINT}/v1/schema/write",
@@ -196,14 +224,12 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
         resource_id      – Object ID of the resource  (e.g. "search_web")
         relation         – Relation name from the schema (e.g. "direct_agent")
         subject_type     – "agent" or "user"
-        subject_id       – Object ID of the subject, or "me" (see note below)
+        subject_id       – Object ID of the subject, or "me" to resolve from headers
         subject_relation – (optional) sub-relation for group expansion
 
-    subject_id="me" is a convenience that maps to gateway-provided identity
-    headers (X-Remote-Agent / X-Remote-User). NOTE: the current PingGateway/P1AZ
-    deployment delivers delegated identity in the exchanged token claims
-    (sub = human, act.sub / act.sub_hash = agent), not these headers, so "me" is
-    inert here — pass explicit subject IDs.
+    subject_id="me" resolves automatically:
+        subject_type="agent" → value of X-Remote-Agent header
+        subject_type="user"  → value of X-Remote-User header
 
     Example – grant agent:agent-001 direct execute access to mcp_tool:search_web:
         [
@@ -229,11 +255,6 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
           }
         ]
     """
-    # No authorization check here — the bridge is an executor; P1AZ at the
-    # gateway/resource server authorizes the caller upstream. The header reads
-    # below only back the legacy subject_id="me" convenience (see docstring);
-    # the current gateway carries identity in the token, so they are usually
-    # empty and "me" should not be relied on.
     _req = get_http_request()
     authenticated_user  = _req.headers.get("X-Remote-User") if _req else None
     authenticated_agent = _req.headers.get("X-Remote-Agent") if _req else None
@@ -253,7 +274,7 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
         subject: dict = {
             "object": {
                 "objectType": u.subject_type,
-                "objectId":   subject_id,
+                "objectId":   to_storage_id(subject_id),
             }
         }
         if u.subject_relation:
@@ -264,7 +285,7 @@ async def update_relationships(updates: list[RelationshipUpdateItem]) -> str:
             "relationship": {
                 "resource": {
                     "objectType": u.resource_type,
-                    "objectId":   u.resource_id,
+                    "objectId":   to_storage_id(u.resource_id),
                 },
                 "relation": u.relation,
                 "subject":  subject,
@@ -294,10 +315,9 @@ async def check_permission(args: PermissionCheckArgs) -> str:
         PERMISSIONSHIP_NO_PERMISSION
         PERMISSIONSHIP_CONDITIONAL_PERMISSION
 
-    subject_id="me" maps to gateway-provided identity headers (X-Remote-Agent /
-    X-Remote-User). NOTE: the current gateway delivers delegated identity in the
-    token claims (sub = human, act.sub / act.sub_hash = agent), not these
-    headers, so "me" is inert here — pass an explicit subject_id.
+    Use subject_id="me" to check the calling agent or user automatically:
+        subject_type="agent", subject_id="me"  → resolved from X-Remote-Agent header
+        subject_type="user",  subject_id="me"  → resolved from X-Remote-User header
 
     Example – verify agent:agent-001 can execute mcp_tool:search_web:
         resource_type = "mcp_tool"
@@ -322,9 +342,9 @@ async def check_permission(args: PermissionCheckArgs) -> str:
             f"{SPICEDB_ENDPOINT}/v1/permissions/check",
             headers=_spicedb_headers(),
             json={
-                "resource":   {"objectType": args.resource_type, "objectId": args.resource_id},
+                "resource":   {"objectType": args.resource_type, "objectId": to_storage_id(args.resource_id)},
                 "permission": args.permission,
-                "subject":    {"object": {"objectType": args.subject_type, "objectId": subject_id}},
+                "subject":    {"object": {"objectType": args.subject_type, "objectId": to_storage_id(subject_id)}},
             },
             timeout=15,
         )
@@ -352,13 +372,13 @@ async def read_relationships(
     """
     filter_obj: dict = {"resourceType": resource_type}
     if resource_id:
-        filter_obj["optionalResourceId"] = resource_id
+        filter_obj["optionalResourceId"] = to_storage_id(resource_id)
     if relation:
         filter_obj["optionalRelation"] = relation
     if subject_type:
         filter_obj["optionalSubjectFilter"] = {"subjectType": subject_type}
         if subject_id:
-            filter_obj["optionalSubjectFilter"]["optionalSubjectId"] = subject_id
+            filter_obj["optionalSubjectFilter"]["optionalSubjectId"] = to_storage_id(subject_id)
 
     results: list[str] = []
     async with httpx.AsyncClient() as client:
@@ -378,9 +398,9 @@ async def read_relationships(
             res = rel.get("resource", {})
             sub = rel.get("subject", {}).get("object", {})
             results.append(
-                f"{res.get('objectType')}:{res.get('objectId')}"
+                f"{res.get('objectType')}:{to_external_id(res.get('objectId', ''))}"
                 f"#{rel.get('relation')}"
-                f"@{sub.get('objectType')}:{sub.get('objectId')}"
+                f"@{sub.get('objectType')}:{to_external_id(sub.get('objectId', ''))}"
             )
     return results
 
@@ -402,7 +422,8 @@ def create_app() -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app):
-        set_valid_tokens(await get_live_schema_tokens())
+        global VALID_TOKENS
+        VALID_TOKENS = await get_live_schema_tokens()
         async with inner.lifespan(app):
             yield
 
