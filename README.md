@@ -190,7 +190,7 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - **Inbound** (writes + `/check`): raw IDs from P1AZ or the Governor (e.g. `did:web:example.com`, `system:serviceaccount:ns:sa`, `projects/123/.../engines/456`) are passed through `to_storage_id()` — safe IDs pass through unchanged; unsafe IDs are base64url-encoded with a `b64_` prefix.
 - **Outbound** (reads): stored IDs are passed through `to_external_id()` — `b64_`-prefixed values are decoded back to the canonical form; plain IDs pass through unchanged.
 
-This means P1AZ and the Governor always work with canonical identifiers (hostnames, subs, DIDs) regardless of what SpiceDB stores internally. The encoding is stateless and reversible — no lookup table needed.
+This encoding is a **SpiceDB-specific concern only** — the Registry PIP (PostgreSQL) stores and serves canonical IDs directly with no encoding whatsoever. P1AZ and the Governor always work with canonical identifiers; only the MCP bridge ever sees `b64_`-prefixed values.
 
 ### Registry PIP — `registry_service/`
 
