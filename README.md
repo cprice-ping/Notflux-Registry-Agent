@@ -185,6 +185,13 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - `subject_id="me"` for **users** is resolved server-side from the `X-Remote-User` header injected by PingOne Advanced Services gateway (identifies the calling human admin).
 - Agent identities are always explicit canonical IDs — never auto-resolved from headers.
 
+**ID normalisation** — `id_codec.py` is the bridge between the outside world and SpiceDB's restricted character set (`[a-zA-Z0-9/_|=+-]`). It runs on every inbound write and every outbound read:
+
+- **Inbound** (writes + `/check`): raw IDs from P1AZ or the Governor (e.g. `did:web:example.com`, `system:serviceaccount:ns:sa`, `projects/123/.../engines/456`) are passed through `to_storage_id()` — safe IDs pass through unchanged; unsafe IDs are base64url-encoded with a `b64_` prefix.
+- **Outbound** (reads): stored IDs are passed through `to_external_id()` — `b64_`-prefixed values are decoded back to the canonical form; plain IDs pass through unchanged.
+
+This means P1AZ and the Governor always work with canonical identifiers (hostnames, subs, DIDs) regardless of what SpiceDB stores internally. The encoding is stateless and reversible — no lookup table needed.
+
 ### Registry PIP — `registry_service/`
 
 Policy Information Point — the canonical entity store mapping human-friendly names to the stable IDs used in SpiceDB.
