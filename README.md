@@ -76,7 +76,17 @@ All three application components run in the `ping-devops-cprice` Kubernetes name
 │   ├── patch-p1az.yaml         # PingOne Advanced Services gateway patch
 │   └── secrets.yaml            # ⚠ Not committed — see Configuration below
 ├── mcp/                        # SpiceDB MCP Bridge source
-│   ├── server.py               # FastMCP + Starlette app
+│   ├── server.py               # FastMCP + Starlette app + /check REST endpoint
+│   ├── id_codec.py             # SpiceDB-safe ID encoding (base64url)
+│   ├── requirements.txt
+│   └── Dockerfile
+├── registry_service/           # Registry PIP (Policy Information Point)
+│   ├── app/
+│   │   ├── main.py             # Combined ASGI: /mcp + /v1/entities REST
+│   │   ├── mcp_server.py       # FastMCP tools for the Conductor Agent
+│   │   ├── rest_api.py         # GET /v1/entities/{id} for Kong-auth'd consumers
+│   │   ├── models.py           # SQLAlchemy Entity model
+│   │   └── schemas.py          # Pydantic response schemas
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── scripts/
@@ -172,7 +182,17 @@ Google ADK `LlmAgent` wrapped in an [ag_ui_adk](https://github.com/ag-ui-protoco
 - On startup, calls SpiceDB to read the live schema and extracts all `relation`/`permission` token names into `VALID_TOKENS`.
 - Pydantic v2 models (`PermissionCheckArgs`, `RelationshipUpdateItem`) validate all inputs. The `permission` and `relation` fields are checked against `VALID_TOKENS`, rejecting invented names with a clear error.
 - `resource_type` and `subject_type` are `Literal` types — FastMCP compiles these to an explicit enum in the JSON Schema sent to the LLM.
-- `subject_id="me"` is resolved server-side from `X-Remote-Agent` / `X-Remote-User` headers injected by PingOne Advanced Services gateway.
+- `subject_id="me"` for **users** is resolved server-side from the `X-Remote-User` header injected by PingOne Advanced Services gateway (identifies the calling human admin).
+- Agent identities are always explicit canonical IDs — never auto-resolved from headers.
+
+### Registry PIP — `registry_service/`
+
+Policy Information Point — the canonical entity store mapping human-friendly names to the stable IDs used in SpiceDB.
+
+- **MCP interface** (`/mcp`): used by the Registry Governor to register, resolve, list, and search entities.
+- **REST interface** (`/v1/entities/{id}`): designed for high-frequency lookups by Kong-authenticated consumers. P1AZ does **not** use this path for permission checks — it calls `/check` on the MCP bridge instead.
+- Entity IDs for `mcp_server` type **must be the Kubernetes service hostname** (e.g. `weather-mcp-server`). This is the same ID P1AZ extracts from the Gateway request URL and passes to the SpiceDB check.
+- Backed by PostgreSQL (shared `registry-postgres` instance, `registry` database).
 
 ---
 
@@ -248,18 +268,36 @@ docker push docker.io/pricecs/registry-governor:latest
 docker build -t docker.io/pricecs/spicedb-mcp-bridge:latest ./mcp
 docker push docker.io/pricecs/spicedb-mcp-bridge:latest
 
+# Registry PIP
+docker build -t docker.io/pricecs/registry-pip:latest ./registry_service
+docker push docker.io/pricecs/registry-pip:latest
+
 # Apply manifests
 kubectl apply -f k8s/secrets.yaml
-kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/registry-pip-postgres.yaml   # Postgres + spicedb-create-db Job
+kubectl wait --for=condition=complete job/spicedb-create-db -n ping-devops-cprice --timeout=60s
+kubectl apply -f k8s/registry-pip.yaml
+kubectl apply -f k8s/deployment.yaml              # SpiceDB (migrate init container runs automatically)
 kubectl apply -f k8s/mcp-bridge.yaml
 kubectl apply -f k8s/registry-agent.yaml
 kubectl apply -f k8s/frontend.yaml
 
 # Restart to pick up new images
-kubectl rollout restart deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+kubectl rollout restart deployment/registry-frontend deployment/registry-agent \
+  deployment/spicedb-mcp-bridge deployment/registry-pip \
   -n ping-devops-cprice
-kubectl rollout status deployment/registry-frontend deployment/registry-agent deployment/spicedb-mcp-bridge \
+kubectl rollout status deployment/registry-frontend deployment/registry-agent \
+  deployment/spicedb-mcp-bridge deployment/registry-pip \
   -n ping-devops-cprice --timeout=180s
+
+# Load SpiceDB application schema (first time only — persists in Postgres)
+kubectl port-forward svc/spicedb -n ping-devops-cprice 8443:8443 &
+curl -s -X POST http://localhost:8443/v1/schema/write \
+  -H "Authorization: Bearer $(kubectl get secret spicedb-preshared-key \
+    -n ping-devops-cprice -o jsonpath='{.data.presharedKey}' | base64 -d)" \
+  -H "Content-Type: application/json" \
+  -d "{\"schema\": $(cat schema/schema.zed | jq -Rs .)}"
+kill %1
 ```
 
 ### Endpoints (production)
@@ -267,8 +305,12 @@ kubectl rollout status deployment/registry-frontend deployment/registry-agent de
 | Service | URL |
 |---|---|
 | Dashboard | `https://notflux-registry.ping-devops.com` |
-| MCP Bridge | `https://notflux-registry-mcp.ping-devops.com/mcp` |
+| MCP Bridge (agent tools) | `https://notflux-registry-mcp.ping-devops.com/mcp` |
+| MCP Bridge (P1AZ check) | `https://notflux-registry-mcp.ping-devops.com/check` |
+| Registry PIP (entity REST) | `https://notflux-registry-pip.ping-devops.com/v1/entities/{id}` |
+| Registry PIP (MCP tools) | `https://notflux-registry-pip.ping-devops.com/mcp` |
 | Agent (AG-UI) | Internal ClusterIP — accessed via frontend proxy |
+| SpiceDB | Internal ClusterIP only — no public Ingress |
 
 ---
 

@@ -363,13 +363,22 @@ You have exclusive access to the SpiceDB relationship graph through your tools.
 ────────────────────────────────────────────────────────────────────────────
 IDENTITY RESOLUTION
 ────────────────────────────────────────────────────────────────────────────
-• When a user says "me", "this agent", or "myself":
-    - For agent subjects  → use subject_id="me"  (resolved from X-Remote-Agent)
-    - For user subjects   → use subject_id="me"  (resolved from X-Remote-User)
+• Agent identities are always explicit — use the canonical ID as registered
+  in SpiceDB (hostname, k8s SA name, Vertex AI resource ID, DID, etc.).
+  Never try to auto-resolve agent identity from headers.
+
+• The Registry Governor's own SpiceDB identity (for self-checks or when the
+  user asks about "the registry agent" or "this agent"):
+    system:serviceaccount:ping-devops-cprice:notflux-registry-agent
 
 • When provisioning access for the main operational Notflux agent, use its
   static Vertex AI resource ID as the subject_id:
     projects/3682147732/locations/us-central1/reasoningEngines/notflux-agent
+
+• For user subjects ("me", "myself", the logged-in admin):
+    subject_id="me" is resolved from the X-Remote-User header injected by
+    the Gateway. Use this when checking or granting the calling human's
+    own access.
 
 ────────────────────────────────────────────────────────────────────────────
 SAFETY RULES  (never bypass these)
