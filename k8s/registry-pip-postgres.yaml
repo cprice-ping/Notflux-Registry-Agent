@@ -130,3 +130,75 @@ spec:
         resources:
           requests:
             storage: 10Gi
+
+---
+###############################################################################
+# Job – create SpiceDB database and user on the shared Postgres instance.
+#
+# Runs once (restartPolicy: OnFailure) and is idempotent — CREATE DATABASE /
+# CREATE USER are guarded by IF NOT EXISTS / DO-block so re-running is safe.
+#
+# Apply after registry-pip-postgres is running:
+#   kubectl apply -f k8s/registry-pip-postgres.yaml
+#   kubectl wait --for=condition=complete job/spicedb-create-db -n ping-devops-cprice --timeout=60s
+###############################################################################
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spicedb-create-db
+  namespace: ping-devops-cprice
+  labels:
+    app.kubernetes.io/name: spicedb
+    app.kubernetes.io/component: db-init
+    app.kubernetes.io/part-of: notflux-registry
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-db
+          image: postgres:16
+          env:
+            - name: PGHOST
+              value: registry-postgres.ping-devops-cprice.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-pip-postgres-secrets
+                  key: POSTGRES_DB
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: registry-pip-postgres-secrets
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: registry-pip-postgres-secrets
+                  key: POSTGRES_PASSWORD
+            - name: SPICEDB_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: spicedb-postgres-secrets
+                  key: POSTGRES_USER
+            - name: SPICEDB_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spicedb-postgres-secrets
+                  key: POSTGRES_PASSWORD
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "Creating SpiceDB database and user..."
+              psql -c "CREATE DATABASE spicedb;" 2>/dev/null || echo "database already exists, skipping"
+              psql -c "CREATE USER spicedb WITH PASSWORD '$SPICEDB_DB_PASSWORD';" 2>/dev/null || echo "user already exists, skipping"
+              psql -c "ALTER USER spicedb WITH PASSWORD '$SPICEDB_DB_PASSWORD';"
+              psql -c "GRANT ALL PRIVILEGES ON DATABASE spicedb TO spicedb;"
+              # PostgreSQL 15+ revokes CREATE on public schema by default — grant it explicitly.
+              psql -d spicedb -c "GRANT ALL ON SCHEMA public TO spicedb;"
+              echo "Done."

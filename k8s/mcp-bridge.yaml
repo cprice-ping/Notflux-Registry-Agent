@@ -168,6 +168,15 @@ spec:
                 name: spicedb-mcp-bridge
                 port:
                   name: http
+          # P1AZ permission check — raw IDs are encoded by the bridge before
+          # forwarding to SpiceDB. Auth: Bearer <mcpApiKey from secret>.
+          - path: /check
+            pathType: Exact
+            backend:
+              service:
+                name: spicedb-mcp-bridge
+                port:
+                  name: http
   tls:
     - hosts:
         - notflux-registry-mcp.ping-devops.com

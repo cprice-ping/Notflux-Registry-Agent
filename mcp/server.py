@@ -104,7 +104,7 @@ class _BearerAuth(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 ObjectType = Literal["agent", "user", "mcp_server", "mcp_tool"]
-SubjectType = Literal["agent", "user"]
+SubjectType = Literal["agent", "user", "mcp_server"]
 
 
 class PermissionCheckArgs(BaseModel):
@@ -414,9 +414,70 @@ def create_app() -> Starlette:
     Wrap the FastMCP streamable-HTTP ASGI app with bearer-token auth middleware.
     The MCP endpoint is mounted at /mcp (matches the Ingress path).
     /healthz is an unauthenticated liveness/readiness target for K8s probes.
+    /check  is a REST endpoint for P1AZ permission checks — accepts raw IDs,
+            applies to_storage_id() encoding, and forwards to SpiceDB.
     """
     async def healthz(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
+
+    async def check(request: Request) -> JSONResponse:
+        """
+        P1AZ permission check endpoint.
+
+        Accepts the standard SpiceDB check payload and handles ID encoding
+        transparently so P1AZ can send raw agent/hostname identifiers directly.
+
+        Request body (same shape as /v1/permissions/check):
+            {
+              "resource":   {"objectType": "mcp_server", "objectId": "weather-mcp-server"},
+              "subject":    {"object": {"objectType": "agent", "objectId": "<sub>"}},
+              "permission": "agent_can_connect"
+            }
+
+        Returns the SpiceDB response as-is, e.g.:
+            {"permissionship": "PERMISSIONSHIP_HAS_PERMISSION"}
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+        resource   = body.get("resource", {})
+        subject    = body.get("subject", {})
+        subject_obj = subject.get("object", {})
+        permission = body.get("permission", "")
+
+        if not resource.get("objectType") or not resource.get("objectId") \
+                or not subject_obj.get("objectType") or not subject_obj.get("objectId") \
+                or not permission:
+            return JSONResponse(
+                {"error": "Required fields: resource.objectType, resource.objectId, "
+                           "subject.object.objectType, subject.object.objectId, permission"},
+                status_code=400,
+            )
+
+        spicedb_payload = {
+            "resource": {
+                "objectType": resource["objectType"],
+                "objectId":   to_storage_id(resource["objectId"]),
+            },
+            "permission": permission,
+            "subject": {
+                "object": {
+                    "objectType": subject_obj["objectType"],
+                    "objectId":   to_storage_id(subject_obj["objectId"]),
+                }
+            },
+        }
+
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SPICEDB_ENDPOINT}/v1/permissions/check",
+                headers=_spicedb_headers(),
+                json=spicedb_payload,
+                timeout=15,
+            )
+        return JSONResponse(r.json(), status_code=r.status_code)
 
     inner = mcp.http_app(path="/mcp")
 
@@ -430,6 +491,7 @@ def create_app() -> Starlette:
     return Starlette(
         routes=[
             Route("/healthz", healthz),
+            Route("/check", check, methods=["POST"]),
             Mount("/", app=inner),
         ],
         lifespan=lifespan,

@@ -38,8 +38,108 @@ const runtimeInfo = {
   telemetryDisabled: true,
 };
 
-function streamResponse(upstream: Response) {
-  return new Response(upstream.body, {
+/**
+ * Strip Gemini code-execution markup from AG-UI TEXT_MESSAGE_CONTENT deltas.
+ *
+ * Gemini 2.5 Flash emits tool calls as <tool_code>...</tool_code> and results
+ * as <tool_response>...</tool_response> inside the plain-text stream.  These
+ * are internal artefacts and should never surface in the chat UI.
+ *
+ * The filter is stateful: tags may span multiple SSE chunks, so we track
+ * whether we are currently inside a suppressed block.
+ */
+function filterGeminiToolMarkup(upstream: Response): Response {
+  if (!upstream.body) return upstream;
+
+  const OPEN_TAGS  = ["<tool_code>", "<tool_response>"];
+  const CLOSE_TAGS = ["</tool_code>", "</tool_response>"];
+
+  let depth   = 0;   // >0 means we are inside a suppressed block
+  let buf     = "";  // carries partial tag text across chunk boundaries
+
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      const text = decoder.decode(chunk, { stream: true });
+
+      let out = "";
+      let pos = 0;
+
+      while (pos < text.length) {
+        if (depth === 0) {
+          // Outside a suppressed block: look for an opening tag.
+          const combined = buf + text.slice(pos);
+          let earliest = -1;
+          let matchTag = "";
+          for (const tag of OPEN_TAGS) {
+            const idx = combined.indexOf(tag);
+            if (idx !== -1 && (earliest === -1 || idx < earliest)) {
+              earliest = idx; matchTag = tag;
+            }
+          }
+          if (earliest !== -1) {
+            // Emit everything before the tag, then enter suppressed mode.
+            out += combined.slice(0, earliest);
+            buf  = "";
+            pos  = text.length - (combined.length - earliest - matchTag.length);
+            depth++;
+          } else {
+            // No opening tag found — but it might be split across the boundary.
+            // Keep a tail of (max tag length - 1) chars in the buffer.
+            const tail = Math.max(0, combined.length - 20);
+            out += combined.slice(0, tail);
+            buf  = combined.slice(tail);
+            pos  = text.length;
+          }
+        } else {
+          // Inside a suppressed block: scan for the matching close tag.
+          const combined = buf + text.slice(pos);
+          let earliest = -1;
+          let matchTag = "";
+          for (const tag of CLOSE_TAGS) {
+            const idx = combined.indexOf(tag);
+            if (idx !== -1 && (earliest === -1 || idx < earliest)) {
+              earliest = idx; matchTag = tag;
+            }
+          }
+          if (earliest !== -1) {
+            buf  = "";
+            pos  = text.length - (combined.length - earliest - matchTag.length);
+            depth--;
+          } else {
+            buf = combined.slice(Math.max(0, combined.length - 20));
+            pos = text.length;
+          }
+        }
+      }
+
+      // Only rewrite TEXT_MESSAGE_CONTENT events; pass others through as-is.
+      // The rewrite replaces the "delta" value with the filtered text.
+      if (out) {
+        const rewritten = out.replace(
+          /("type"\s*:\s*"TEXT_MESSAGE_CONTENT"[^}]*"delta"\s*:\s*)"((?:[^"\\]|\\.)*)"/g,
+          (match, prefix, delta) => {
+            // Decode JSON-escaped string, strip any residual tag fragments, re-encode.
+            const decoded = delta.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+            const filtered = decoded.replace(/<\/?tool_(?:code|response)>/g, "").trimEnd();
+            if (!filtered) return match.replace(prefix, `"_type_suppress":"TEXT_MESSAGE_CONTENT","_delta_suppress":`);
+            const encoded  = filtered.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+            return `${prefix}"${encoded}"`;
+          },
+        );
+        controller.enqueue(encoder.encode(rewritten));
+      }
+    },
+    flush(controller) {
+      // Emit anything left in the buffer that wasn't suppressed.
+      if (buf && depth === 0) {
+        controller.enqueue(new TextEncoder().encode(buf));
+      }
+    },
+  });
+
+  return new Response(upstream.body.pipeThrough(transform), {
     status: upstream.status,
     headers: {
       "Content-Type": upstream.headers.get("content-type") ?? "text/event-stream",
@@ -47,6 +147,10 @@ function streamResponse(upstream: Response) {
       "X-Accel-Buffering": "no",
     },
   });
+}
+
+function streamResponse(upstream: Response) {
+  return filterGeminiToolMarkup(upstream);
 }
 
 async function forwardToAgent(req: NextRequest, payload: unknown) {

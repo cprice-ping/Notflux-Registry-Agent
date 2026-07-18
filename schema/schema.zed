@@ -10,7 +10,8 @@ definition agent {
 definition mcp_server {
     relation authorized_agent: agent
     relation authorized_user: user
-    relation public_to_all_users: user:* permission view_server = authorized_user + public_to_all_users
+    relation public_to_all_users: user:*
+    permission view_server = authorized_user + public_to_all_users
     permission agent_can_connect = authorized_agent
 }
 

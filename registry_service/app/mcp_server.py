@@ -150,20 +150,41 @@ async def list_entities(type: str = "", limit: int = 200) -> list[dict[str, Any]
 @mcp.tool()
 async def find_entity_by_name(name: str, type: str = "", limit: int = 200) -> list[dict[str, Any]]:
     """
-    Search entities by case-insensitive name substring.
+    Search entities by fuzzy name match.
+
+    Splits the query into words and checks that every word appears in either
+    the entity's display name or its canonical ID (hostname slug). This means
+    "Weather MCP server" will match an entity with id="weather-mcp-server"
+    even if the words are separated by hyphens in the stored value.
 
     Args:
-        name: Name fragment to search for.
+        name: Name fragment(s) to search for — space-separated words are each
+              matched independently (AND logic) against both name and id fields.
         type: Optional entity type filter.
         limit: Max rows to return (1-1000, default 200).
     """
+    from sqlalchemy import and_, or_
+
     if limit < 1:
         limit = 1
     if limit > 1000:
         limit = 1000
 
+    words = [w for w in name.lower().split() if w]
+    if not words:
+        return []
+
     async with AsyncSessionLocal() as session:
-        stmt = select(Entity).where(func.lower(Entity.name).contains(name.lower()))
+        stmt = select(Entity)
+        # Every word must appear in either the name or the id field.
+        word_conditions = [
+            or_(
+                func.lower(Entity.name).contains(word),
+                func.lower(Entity.id).contains(word),
+            )
+            for word in words
+        ]
+        stmt = stmt.where(and_(*word_conditions))
         if type:
             stmt = stmt.where(Entity.type == type)
         stmt = stmt.order_by(Entity.name.asc()).limit(limit)

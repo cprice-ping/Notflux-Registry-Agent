@@ -53,6 +53,23 @@ spec:
         app.kubernetes.io/part-of: notflux-registry
     spec:
       terminationGracePeriodSeconds: 30
+      initContainers:
+        # Run SpiceDB migrations before the server starts.
+        # Safe to re-run on every rollout — migrate head is idempotent.
+        - name: spicedb-migrate
+          image: authzed/spicedb:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - migrate
+            - head
+            - --datastore-engine=postgres
+            - --datastore-conn-uri=$(SPICEDB_DATASTORE_URI)
+          env:
+            - name: SPICEDB_DATASTORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: spicedb-postgres-secrets
+                  key: SPICEDB_DATASTORE_URI
       containers:
         - name: spicedb
           # Pin to a specific release tag in production, e.g. v1.30.0
@@ -60,13 +77,8 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - serve
-            # ----------------------------------------------------------------
-            # Datastore – memory is suitable for development only.
-            # For production use:
-            #   --datastore-engine=cockroachdb
-            #   --datastore-conn-uri=$(DATASTORE_URI)
-            # ----------------------------------------------------------------
-            - --datastore-engine=memory
+            - --datastore-engine=postgres
+            - --datastore-conn-uri=$(SPICEDB_DATASTORE_URI)
             # Preshared key loaded from the Secret defined in secrets.yaml
             - --grpc-preshared-key=$(SPICEDB_PRESHARED_KEY)
             - --http-enabled=true
@@ -77,6 +89,11 @@ spec:
                 secretKeyRef:
                   name: spicedb-preshared-key
                   key: presharedKey
+            - name: SPICEDB_DATASTORE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: spicedb-postgres-secrets
+                  key: SPICEDB_DATASTORE_URI
           ports:
             - name: grpc
               containerPort: 50051
@@ -149,44 +166,7 @@ spec:
       protocol: TCP
 
 ---
-###############################################################################
-# Ingress – SpiceDB HTTP REST JSON API
-# Routes external HTTP/S traffic from the Notflux Ingress controller to
-# SpiceDB's HTTP gateway so PingGateway and P1AZ can reach the REST JSON API
-# without needing gRPC support.
-#
-# SpiceDB REST API base path: /v1/
-# Example endpoint:           /v1/permissions/check
-#
-# TODO: Replace the host value below with your actual internal DNS name.
-###############################################################################
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: spicedb-http-api
-  namespace: ping-devops-cprice
-  labels:
-    app.kubernetes.io/name: spicedb
-    app.kubernetes.io/component: server
-    app.kubernetes.io/part-of: notflux-registry
-  annotations:
-    # SpiceDB HTTP gateway serves plain HTTP (--http-no-tls); no backend TLS needed.
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    cert-manager.io/cluster-issuer: letsencrypt-ping-cloud
-spec:
-  ingressClassName: nginx-public
-  rules:
-    - host: notflux-registry.ping-devops.com  # TODO: set real hostname
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: spicedb
-                port:
-                  name: http
-  tls:
-  - hosts:
-    - notflux-registry.ping-devops.com
-    secretName: notflux-registry-tls
+# The SpiceDB HTTP REST API is intentionally NOT exposed via Ingress.
+# All external access (P1AZ checks and MCP tool calls) is routed through
+# the spicedb-mcp-bridge, which handles auth and ID encoding before
+# forwarding to SpiceDB over the in-cluster ClusterIP service.

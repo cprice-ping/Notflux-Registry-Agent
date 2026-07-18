@@ -211,7 +211,17 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
         mcp_token = _exchange_for_mcp_token(agent_token)
     except Exception as exc:
         logging.error(f"inject_mcp_auth: token exchange failed — {exc}. MCP tools unavailable this turn.")
-        return None
+        return types.Content(
+            role="model",
+            parts=[types.Part(
+                text=(
+                    f"I can't complete your request right now because token exchange failed: {exc}\n\n"
+                    "This usually means the DaVinci policy flow is unreachable, the service account "
+                    "token is missing, or the agent token audience is incorrect. "
+                    "Please check the agent logs and retry."
+                )
+            )],
+        )
 
     mcp_auth = f"Bearer {mcp_token}"
 
@@ -256,8 +266,40 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
             f"content-type={probe_resp.headers.get('content-type', '?')!r}  "
             f"body={probe_resp.text[:200]!r}"
         )
+        if probe_resp.status_code == 401:
+            return types.Content(
+                role="model",
+                parts=[types.Part(
+                    text=(
+                        "I can't reach the MCP server right now: the gateway rejected the "
+                        "exchanged token (401 Unauthorized). The token audience or scope may "
+                        "be misconfigured. Please check the agent logs and retry."
+                    )
+                )],
+            )
+        if probe_resp.status_code not in (200, 201):
+            return types.Content(
+                role="model",
+                parts=[types.Part(
+                    text=(
+                        f"I can't reach the MCP server right now "
+                        f"(HTTP {probe_resp.status_code} from {BRIDGE_URL}). "
+                        "The service may be temporarily unavailable. Please retry in a moment."
+                    )
+                )],
+            )
     except Exception as probe_exc:
         logging.warning(f"inject_mcp_auth: mcp_probe failed — {probe_exc}")
+        return types.Content(
+            role="model",
+            parts=[types.Part(
+                text=(
+                    f"I can't reach the MCP server at {BRIDGE_URL}: {probe_exc}\n\n"
+                    "The service may be down or unreachable from the cluster. "
+                    "Please check the spicedb-mcp-bridge pod and retry."
+                )
+            )],
+        )
 
     # Log the exact URL + auth header prefix being set on McpToolset
     token_preview = mcp_token[-8:] if len(mcp_token) > 8 else "<short>"
@@ -350,8 +392,45 @@ WORKFLOW
 • For any request to show, list, count, or summarise agents, MCP servers,
   tools, grants, or relationships, you MUST call read_relationships to fetch
   live data. Do not answer those requests from schema alone.
+• read_relationships can be called with only resource_type (and optionally
+  relation) to retrieve ALL relationships of that type in a single call —
+  you do NOT need a specific resource_id. For example:
+    - "list all MCP servers and their authorized agents":
+        read_relationships(resource_type="mcp_server", relation="authorized_agent")
+    - "show all tool grants":
+        read_relationships(resource_type="mcp_tool", relation="direct_agent")
+  Never tell the user this requires multiple calls or is unsupported — it is
+  always achievable in one read_relationships call per relation type.
+• "Show all agent relationships" or "list agent relationships" means ALL
+  relationships that involve agents. Make THREE calls and merge the results:
+    1. read_relationships(resource_type="mcp_server", relation="authorized_agent")
+    2. read_relationships(resource_type="mcp_tool",   relation="direct_agent")
+    3. read_relationships(resource_type="agent")   ← ownership/active_driver
+  Present all results together. If all three return empty, tell the user
+  there are no relationships registered yet and offer to help register some.
 • If a list/count query would require multiple read_relationships calls,
   perform them all before answering, then merge the results in your response.
+• MCP SERVER ONBOARDING — follow this sequence strictly:
+    1. Register the server entity in the PIP:
+         register_entity(id=<hostname>, type="mcp_server", name=<friendly name>, ...)
+    2. Write the server relationship in SpiceDB (authorized_agent for each agent):
+         update_relationships([{resource_type="mcp_server", resource_id=<hostname>,
+                                relation="authorized_agent", subject_type="agent",
+                                subject_id=<agent_id>}])
+       For servers behind the Gateway this step is REQUIRED before any agent
+       (including the Registry Agent itself) can connect.
+    3. Register tools if provided by the caller. For each tool name:
+         a. register_entity(id=<hostname>_<tool_name>, type="mcp_tool", ...)
+         b. update_relationships([{resource_type="mcp_tool",
+                                   resource_id=<hostname>_<tool_name>,
+                                   relation="parent_server",
+                                   subject_type="mcp_server",
+                                   subject_id=<hostname>}])
+       Tool names use the convention <server_hostname>_<tool_name>.
+       If the caller does not provide a tool list, complete steps 1-2 and
+       inform them that tools can be registered later.
+    Never attempt step 3 for a Gateway-protected server before step 2 is
+    confirmed — the server will be unreachable until it is registered.
 • Registry-PIP ID handling:
     - DO NOT request, mention, or depend on any `sub_hash` field.
     - `register_entity` and `resolve_entity` use canonical IDs directly.
