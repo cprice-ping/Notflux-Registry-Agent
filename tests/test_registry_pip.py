@@ -45,7 +45,7 @@ async def _schema():
         await engine.dispose()
 
 
-async def test_register_resolves_with_safe_sub_hash():
+async def test_register_resolves_with_encoded_id():
     from app.database import AsyncSessionLocal
     from app.id_codec import to_storage_id
     from app.mcp_server import register_entity, resolve_entity
