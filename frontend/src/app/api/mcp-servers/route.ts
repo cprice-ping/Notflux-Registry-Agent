@@ -9,8 +9,16 @@ export async function GET() {
   const cookieStore = await cookies();
   const agentToken = cookieStore.get("registry_agent_token")?.value;
 
-  const headers: Record<string, string> = {};
-  if (agentToken) headers["x-agent-authorization"] = `Bearer ${agentToken}`;
+  // Require a session. Unauthenticated callers should not be able to trigger
+  // outbound probes from the agent or enumerate internal MCP endpoints and
+  // tool names. The dashboard only fetches this once logged in.
+  if (!agentToken) {
+    return NextResponse.json({ error: "authentication required" }, { status: 401 });
+  }
+
+  const headers: Record<string, string> = {
+    "x-agent-authorization": `Bearer ${agentToken}`,
+  };
 
   const resp = await fetch(`${AGENT_URL}/mcp-servers`, {
     cache: "no-store",
