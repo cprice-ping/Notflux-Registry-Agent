@@ -160,12 +160,21 @@ async function forwardToAgent(req: NextRequest, payload: unknown) {
     cookiePresent: Boolean(req.cookies.get("registry_agent_token")?.value),
   });
 
+  // Require a session before invoking the agent. Without this the route is an
+  // open relay to a Gemini-backed agent loop: an unauthenticated caller can burn
+  // LLM quota (the agent runs without MCP tools but still calls the model).
+  // This is authentication — may this caller spend LLM budget — not an
+  // authorization decision; access policy still belongs to P1AZ.
+  if (!agentAuth) {
+    return NextResponse.json({ error: "authentication required" }, { status: 401 });
+  }
+
   const upstream = await fetch(AGENT_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Accept": req.headers.get("accept") ?? "text/event-stream",
-      ...(agentAuth ? { "x-agent-authorization": agentAuth.startsWith("Bearer ") ? agentAuth : `Bearer ${agentAuth}` } : {}),
+      "x-agent-authorization": agentAuth.startsWith("Bearer ") ? agentAuth : `Bearer ${agentAuth}`,
     },
     body: JSON.stringify(payload),
     // @ts-expect-error Node fetch accepts duplex for streamed request/response handling.
