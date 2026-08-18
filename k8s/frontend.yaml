@@ -85,6 +85,14 @@ spec:
                 secretKeyRef:
                   name: registry-frontend-secrets
                   key: PINGONE_CLIENT_SECRET_FRONTEND
+            # Expected aud on the session token, used by src/middleware.ts to
+            # verify callers before they reach the agent. Sourced from the
+            # agent's secret so there is a single copy of the value.
+            - name: PINGONE_AGENT_AUDIENCE
+              valueFrom:
+                secretKeyRef:
+                  name: registry-agent-secrets
+                  key: PINGONE_AGENT_AUDIENCE
             - name: PINGONE_AGENT_SCOPE
               valueFrom:
                 secretKeyRef:
