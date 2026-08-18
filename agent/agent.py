@@ -199,6 +199,18 @@ def _exchange_for_mcp_token(agent_token: str) -> str:
 # Before-agent callback — injects per-session MCP auth before each turn
 # ---------------------------------------------------------------------------
 
+def _refuse(message: str) -> types.Content:
+    """Short-circuit the turn without invoking the model.
+
+    ADK treats a Content returned from before_agent_callback as the agent's
+    response and skips execution entirely — so an unauthenticated caller costs
+    zero tokens. Returning None here instead would let the LlmAgent run with no
+    tools attached, which still bills a model call: that is what made this
+    endpoint usable as a free LLM.
+    """
+    return types.Content(role="model", parts=[types.Part(text=message)])
+
+
 def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content]:
     """Rebuild the McpToolset with the session's exchanged token before each turn.
 
@@ -213,16 +225,16 @@ def inject_mcp_auth(callback_context: CallbackContext) -> Optional[types.Content
     auth = headers.get("agent_authorization", "")
     logging.warning(f"inject_mcp_auth: auth_present={bool(auth)} headers_keys={list(headers.keys())}")
     if not auth:
-        logging.warning("inject_mcp_auth: no x-agent-authorization header — MCP tools unavailable")
-        return None
+        logging.warning("inject_mcp_auth: no x-agent-authorization header — refusing turn")
+        return _refuse("This agent requires an authenticated session.")
 
     agent_token = auth.removeprefix("Bearer ").strip()
 
     try:
         mcp_token = _exchange_for_mcp_token(agent_token)
     except Exception as exc:
-        logging.error(f"inject_mcp_auth: token exchange failed — {exc}. MCP tools unavailable this turn.")
-        return None
+        logging.error(f"inject_mcp_auth: token exchange failed — {exc}. Refusing turn.")
+        return _refuse("Your session could not be verified. Please sign in again.")
 
     mcp_auth = f"Bearer {mcp_token}"
 
