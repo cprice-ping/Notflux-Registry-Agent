@@ -315,7 +315,6 @@ kubectl create secret generic registry-agent-secrets \
 kubectl create secret generic registry-frontend-secrets \
   --namespace ping-devops-cprice \
   --from-literal=AGENT_ENGINE_URL="<ag-ui-endpoint>" \
-  --from-literal=GOOGLE_GENERATIVE_AI_API_KEY="<key>" \
   --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
   --from-literal=PINGONE_CLIENT_ID_FRONTEND="<pkce-client-id>" \
   --from-literal=PINGONE_CLIENT_SECRET_FRONTEND="<pkce-client-secret>" \

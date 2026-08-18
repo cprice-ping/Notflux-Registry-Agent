@@ -11,8 +11,7 @@
 #   2. Create the frontend secret (holds sensitive env vars):
 #        kubectl create secret generic registry-frontend-secrets \
 #          --namespace ping-devops-cprice \
-#          --from-literal=GOOGLE_GENERATIVE_AI_API_KEY="<key>" \
-#          --from-literal=AGENT_ENGINE_URL="<vertex-streaming-url>" \
+##          --from-literal=AGENT_ENGINE_URL="<vertex-streaming-url>" \
 #          --from-literal=PINGONE_ENV_ID="<pingone-env-id>" \
 #          --from-literal=PINGONE_CLIENT_ID_FRONTEND="<client-id>" \
 #          --from-literal=PINGONE_CLIENT_SECRET_FRONTEND="<client-secret>" \
@@ -64,11 +63,6 @@ spec:
                 secretKeyRef:
                   name: registry-frontend-secrets
                   key: AGENT_ENGINE_URL
-            - name: GOOGLE_GENERATIVE_AI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: registry-frontend-secrets
-                  key: GOOGLE_GENERATIVE_AI_API_KEY
             # ── PingOne (server-side) ──────────────────────────────────────
             - name: PINGONE_ENV_ID
               valueFrom:
